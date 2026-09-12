@@ -1,13 +1,59 @@
 # rice-bootstrap
 
-One-instruction bootstrap and update for common Claude Code project
-configuration: git safety as native permission rules, a session archive with
-a mechanical index, an OWNER-chosen output
-style (the bundled 老弟 style recommended), the OWNER's soft working rules in
-`.claude/rice.md` (imported by `CLAUDE.md` for Claude, pointed at from
-`AGENTS.md` for every other coding agent), and an OWNER-driven handoff to
-Matt Pocock's official skill setup. One public repository is both the Claude Code
-plugin marketplace (`rice-bootstrap`) and the plugin (`rice`).
+One-instruction bootstrap for common Claude Code project configuration: git
+safety as native permission rules, a session archive with a mechanical index,
+an OWNER-chosen output style (the bundled 老弟 style recommended), the OWNER's
+soft working rules in `.claude/rice.md` (imported by `CLAUDE.md` for Claude,
+pointed at from `AGENTS.md` for every other coding agent), and an OWNER-driven
+handoff to Matt Pocock's official skill setup. One public repository is both
+the Claude Code plugin marketplace (`rice-bootstrap`) and the plugin (`rice`).
+
+# OWNER-ONLY: Claude Cloud Environment Setup
+
+**This step can only be done by the OWNER**, in the Claude Code Web UI, on the
+Cloud Environment itself. Rice cannot do it, and neither can any Claude
+session: a session can only configure the repo it is running in, never the
+container template it was started from.
+
+- **Once per Environment.** Paste the script below into that Environment's
+  setup script and save it. There is nothing to repeat afterwards.
+- **Every new container or session** started from that Environment then comes
+  up with RTK, Matt Pocock's skills and rice already installed.
+- **Rice stays current by itself** — the install line names no version, and
+  public `main` always carries the newest published release, so each new
+  container simply gets it. Nothing updates inside a running session, and no
+  already-bootstrapped repo changes because a release happened.
+
+```bash
+set -e
+
+# RTK
+curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+rtk init -g --auto-patch
+
+# Matt Pocock Skills
+claude plugin marketplace add mattpocock/skills
+claude plugin install mattpocock-skills@mattpocock
+
+# Rice — latest released version
+claude plugin marketplace add L26041040/rice-bootstrap
+claude plugin install rice@rice-bootstrap
+```
+
+## Using rice in a repo
+
+Once the Environment is set up, a repo has exactly two rice lifecycles — and
+both are skills, not scripts the OWNER has to remember:
+
+| Intent | Run |
+| --- | --- |
+| Install / configure this repo | `/rice:bootstrap` |
+| Remove rice from this repo | `/rice:rice-uninstall` |
+
+`/rice:bootstrap` configures the *current repo only*; it never installs the
+rice plugin itself — that is the Environment's job, done once, above. There is
+no update lifecycle at all.
 
 # FOR AGENTS
 
@@ -26,18 +72,16 @@ the user to remember or type any command.
 1. Canonical public repository: `L26041040/rice-bootstrap` on GitHub
    (marketplace name `rice-bootstrap`, plugin `rice`, plugin id
    `rice@rice-bootstrap`).
-2. **A release is a branch.** Every version is published once, to the
-   immutable public branch `release/<semver>`, and that branch is the only
-   installation source. This copy of rice is `release/0.1.2`; install it
-   with the official Claude Code plugin mechanism, non-interactive, touching
-   only `~/.claude`:
+2. **Default install — always the latest release.** Public `main` carries
+   exactly the newest published release, so the install line never names a
+   version and never has to be edited:
    ```
-   claude plugin marketplace add L26041040/rice-bootstrap@release/0.1.2
+   claude plugin marketplace add L26041040/rice-bootstrap
    claude plugin install rice@rice-bootstrap
    ```
-   The `@release/0.1.2` suffix is not optional: without it the marketplace
-   follows the repository's default branch, which is a landing page, not a
-   release. Public `main` is never an installation source.
+   These are the official Claude Code plugin commands, non-interactive,
+   touching only `~/.claude`. In Cloud, they belong in the Environment setup
+   script at the top of this README, not in a session.
 3. **User scope only** (the default, and the same way Matt Pocock's plugin
    is installed). Rice does not support being installed at more than one
    scope: which install a session loads is not something rice may guess at,
@@ -46,52 +90,18 @@ the user to remember or type any command.
 4. **No update system, and no auto-update.** Rice has exactly two repo
    lifecycles — `rice:bootstrap` and `rice:rice-uninstall`. It never
    updates itself, on any trigger, and there is no update workflow to
-   invoke. A newer rice is a newer release branch: the OWNER points an
-   Environment (or a machine) at it when they choose to, and repos keep
-   whatever release they were bootstrapped with until then. Nothing asks
-   them to restart a session, migrate a ref, or reason about which build is
-   "latest".
+   invoke. A newer rice reaches an OWNER only when a **new container or
+   session** is provisioned from an Environment — the install line is read
+   then, and `main` is whatever the newest release is at that moment.
+   Already-bootstrapped repos never change because a release happened, and
+   nothing asks anyone to restart a session, migrate a ref, or reason about
+   which build is "latest".
 5. **Local machine**: a newly installed plugin is loaded by the **next**
    session. Start one and run the bootstrap flow below.
 6. **Claude Code on the web**: do not run the two commands inside a session
-   expecting them to persist — `~/.claude` is per-container. See "Claude
-   Code Web setup" below; that is the primary path, not a same-session
-   install.
-
-## Claude Code Web setup (Cloud Environment)
-
-Three layers — worth keeping straight so an install fix lands in the right
-one:
-
-1. **Cloud Environment** — the container template a Claude Code Web session
-   starts from. Anything a session needs *before it starts* belongs in the
-   Environment's setup script. Creating or editing an Environment is a
-   one-time OWNER action in the Claude Code Web UI; rice cannot create or
-   edit one itself.
-2. **rice plugin** — installed once into the Environment's setup script
-   (the same two commands from "Installation" above, release branch and
-   all). Every fresh session started from that Environment already has rice
-   loaded automatically — no per-session install, no `/reload-plugins`.
-   Moving to a newer rice means editing that one line to the new
-   `release/<semver>` and starting a fresh session; nothing in a
-   bootstrapped repo has to change, and rice never does it on its own.
-3. **Repo bootstrap** (`/rice:bootstrap`, see "Bootstrap" below) — configures
-   the *current repo only*. It never (re)installs rice itself; that is the
-   Environment's job, done once.
-
-Recommended: create a dedicated rice Cloud Environment, or add the two
-install commands to an existing dedicated Environment's setup script,
-alongside whatever else it already provisions (e.g. `mattpocock-skills`,
-RTK). Matt Pocock skills are typically already provided by current
-Cloud/platform provisioning — rice's Environment setup does not duplicate
-installing Matt; Matt's own **repo-level** setup
-(`/mattpocock-skills:setup-matt-pocock-skills`) stays a separate, OWNER-only
-step (see "Bootstrap" below).
-
-If a session's Environment genuinely was not set up this way (rice isn't
-loaded), the one-off recovery is: run the two commands inside the current
-session, then start a new one — but that is a fallback, not the normal
-Cloud flow, and does not persist to the next container on its own.
+   expecting them to persist — `~/.claude` is per-container. The
+   OWNER-only Environment setup at the top of this README is the primary
+   path, not a same-session install.
 
 ## Bootstrap
 
@@ -162,6 +172,11 @@ The lifecycle engine (`scripts/rice.py`) decides everything else:
    silently pending. A fresh bootstrap costs the OWNER exactly one
    `rice:bootstrap` invocation — rice never asks for a second one.
 
+Matt Pocock's **repo-level** setup
+(`/mattpocock-skills:setup-matt-pocock-skills`) stays a separate, OWNER-only
+step; the Environment script above installs Matt's plugin, not a repo's
+setup.
+
 If the repo already had its own `/clear` archive hook before rice, the OWNER
 removes that old hook/script before enabling rice's archive; an existing
 `session-history/` can stay.
@@ -198,6 +213,49 @@ trigger. Entrypoint: the `rice:rice-uninstall` skill, which runs
   remove` commands directly; it is never triggered by a repo-scoped
   uninstall and never automatic.
 
+## Pinning a specific version
+
+The default install above is the normal one. Every release is *also*
+published once, to the immutable branch `release/<semver>`, which is never
+moved or overwritten. Name it only when you mean to pin — reproducing a build,
+or rolling back:
+
+```
+claude plugin marketplace add L26041040/rice-bootstrap@release/0.1.3
+claude plugin install rice@rice-bootstrap
+```
+
+`main` is the latest pointer; `release/<semver>` is the version authority. An
+Environment pinned to an old branch stays there forever — that is the point of
+pinning, and the reason not to do it by default.
+
+## Claude Code Web setup (Cloud Environment)
+
+Three layers — worth keeping straight so an install fix lands in the right
+one:
+
+1. **Cloud Environment** — the container template a Claude Code Web session
+   starts from. Anything a session needs *before it starts* belongs in the
+   Environment's setup script. Creating or editing an Environment is a
+   one-time OWNER action in the Claude Code Web UI; rice cannot create or
+   edit one itself, and neither can any Claude session.
+2. **rice plugin** — installed once by that setup script (the canonical
+   script at the top of this README). Every fresh session started from that
+   Environment already has rice loaded automatically — no per-session
+   install, no `/reload-plugins`. Because the line names no version, a
+   container provisioned after a release simply gets it; nothing in a
+   bootstrapped repo changes, and rice never updates itself. Pin
+   `@release/<semver>` in that line only if this Environment must stay on one
+   exact version.
+3. **Repo bootstrap** (`/rice:bootstrap`, see "Bootstrap" above) — configures
+   the *current repo only*. It never (re)installs rice itself; that is the
+   Environment's job, done once.
+
+If a session's Environment genuinely was not set up this way (rice isn't
+loaded), the one-off recovery is: run the two install commands inside the
+current session, then start a new one — but that is a fallback, not the
+normal Cloud flow, and does not persist to the next container on its own.
+
 ## Release / Development
 
 Releases are cut from the private development repository
@@ -206,18 +264,27 @@ skill and `scripts/release.py`, on the OWNER's explicit release intent only.
 
 The public repository is a verified export of an allowlisted surface; it is
 never a mirror, never receives private history, and is never a source of
-truth. Each release is published **once**, as a fresh single-commit history
-on the branch `release/<semver>`:
+truth. Publishing runs on two tracks:
 
-- that branch is immutable — rice's tooling never moves, rewrites or
-  force-pushes one, and publishing a version whose branch already exists
-  FAILS CLOSED, so one semver can never name two different builds;
-- the next version is a new branch, never a new commit on an old one;
+- **`release/<semver>`** — the version authority. Published **once**, as a
+  fresh single-commit history. Immutable: rice's tooling never moves,
+  rewrites or force-pushes one, and publishing a version whose branch
+  already exists FAILS CLOSED, so one semver can never name two different
+  builds. The next version is a new branch, never a new commit on an old
+  one.
+- **`main`** — the latest pointer, and the default install source. After a
+  release branch lands, main moves forward to exactly that branch's tree, as
+  an ordinary commit on its own history: never a force, never a rewrite. The
+  publish verifies both from the remote — main's tree identical to the
+  release branch's, and the version it declares equal to the release —
+  before reporting success. `release.py promote --version <x.y.z>` moves
+  main onto an already-published release branch, reading the tree from that
+  branch rather than from any local export.
 - `.claude-plugin/plugin.json`'s version, the CHANGELOG's top entry and the
-  branch name are the same string, checked mechanically;
-- no git tag and no GitHub release is ever created, private or public.
+  branch name are the same string, checked mechanically; no git tag and no
+  GitHub release is ever created, private or public.
 
 Release checks (tests, manifests, version consistency, this README's
-required sections and its release branch, allowlist completeness,
+required sections, allowlist completeness,
 forbidden-path absence, secret scan, standalone-package validation) are
 mechanical: any FAIL → `RELEASE BLOCKED`, no publish.
