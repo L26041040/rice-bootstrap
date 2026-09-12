@@ -50,13 +50,18 @@ subsystem for this; those two commands are the whole mechanism.
 ## What the script removes (exact matches only)
 
 `.claude/rice.md`; the `@.claude/rice.md` line in `CLAUDE.md` (the file
-itself only if rice created it with nothing but that line);
+itself only if rice created it with nothing but that line); the
+marker-delimited rice pointer block in `AGENTS.md` (the file itself only if
+rice created it with nothing but that block);
 `.claude/rice-version`; `WAITING_FOR_MATT`; the `rice-bootstrap`
 marketplace entry; `enabledPlugins.rice@rice-bootstrap`;
-`env.CLAUDE_CODE_SUBAGENT_MODEL` only while it still equals rice's `sonnet`;
-`env.RICE_SESSION_ARCHIVE`; exactly rice's own `permissions.deny` entries
-(current list minus this build's canonical entries; an entry already gone is
-a no-op); `outputStyle` only when it is exactly `rice:老弟`. Containers rice
+`env.RICE_SESSION_ARCHIVE`; `env.CLAUDE_CODE_SUBAGENT_MODEL` only while it
+still holds the `sonnet` rice used to write there before that pin was
+retired (RICE-BOOTSTRAP-046); one occurrence of each of rice's own
+`permissions.deny` rules, so a repo that already had the same rule keeps its
+own copy in its own position (an entry already gone is a no-op, and an entry
+rice never declared is the project's); `outputStyle` only when it is exactly
+`rice:老弟`. Containers rice
 emptied are dropped; `.claude/` stays whenever anything project-owned is
 left in it.
 
@@ -64,8 +69,9 @@ left in it.
 
 `session-history/**`, custom output styles and any other `outputStyle`,
 `permissions.allow` / `permissions.ask`, deny rules rice did not add, other
-plugins and marketplaces, project env vars and hooks, Matt artifacts
-(`docs/agents/**`, CLAUDE.md sections), RTK, every other repo file, git
+plugins and marketplaces, project env vars and hooks, project-owned
+`AGENTS.md` content, Matt artifacts (`docs/agents/**`, CLAUDE.md sections),
+RTK, every other repo file, git
 history, and the user-level plugin install (see step 3).
 
 Rice only removes rice. If the repo had a different `/clear` archive

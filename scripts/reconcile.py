@@ -1,40 +1,118 @@
-"""Ticket #23: the single deterministic apply/check primitive.
+"""Ticket #23 / RICE-BOOTSTRAP-045/-046: what rice OWNS in a target repo,
+and the four verbs over it -- `check_owned`, `apply`, `remove`, `remnants`.
 
-Both `apply` and `check` operate only against the *currently pinned* ref's
-desired state -- the ref itself is read from the target's own
-.claude/settings.json (whatever bootstrap or rice-update last set it to),
-never supplied as a parameter and never written here. See #13's
-"Reconcile, check, and rice-update": rice-update alone may change `ref`,
-by writing it directly and then invoking this module's `apply` with
-`is_rice_update=True` to converge everything else. Ordinary reconcile
-(apply/check with is_rice_update=False, the default) never does either.
+Ownership is declared once here (RICE-BOOTSTRAP-045) and every lifecycle is
+a verb over that declaration: install and update converge it, repair
+restores what the verifier failed, uninstall subtracts it. Nothing else
+keeps a list of what rice owns.
 
-Four-state logic (missing / match / drift-conflict / drift-overwritten)
-applies to rice-defined settings keys and to the .claude/rice.md
-whole-file case. Owner-defined settings keys (`ref`, `RICE_SESSION_ARCHIVE`)
-are presence-only from this module's point of view: it is never correct
-for apply to create, fix, or reassert them, in any mode, ever -- that is
-bootstrap's job at first-write.
+This module knows nothing about the ENVIRONMENT rice runs in -- no plugin
+list, no hooks, no transcript, no Matt, no RTK, no subprocess at all. Those
+are facts, not ownership, and they live in `evidence.py`
+(RICE-BOOTSTRAP-046). It has no verdict either: it returns items, and
+`verify.py` alone turns them into PASS or FAIL. And it has no git
+responsibility: it writes files, it does not commit them.
 
-Matt setup artifacts and RTK are REQUIRED (v1 is the OWNER's actual
-workflow; Gate B never passes without both). They are presence-only,
-never content-validated, and never written by apply -- Matt/environment
-own that content.
-
-This module has no git responsibility of its own: it writes files, it
-does not commit them. Committing rice-owned changes is the caller's job
-(bootstrap #25 / rice-update #26).
+Both `apply` and `check_owned` work against the *currently pinned* ref's
+desired state -- the ref is read from the target's own
+.claude/settings.json, never supplied as a parameter. Per #13's "Reconcile,
+check, and rice-update", the update lifecycle alone may move it, through
+`move_ref`, and then converge everything else with
+`apply(is_rice_update=True)`.
 """
 import json
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-import archive_hook
-import output_styles
 import settings_template
 
+# --------------------------------------------------------------------------
+# What rice owns in a target repo -- declared once (RICE-BOOTSTRAP-045).
+#
+# Every lifecycle is a different verb over these same declarations: install
+# and update converge them, repair restores exactly the ones the verifier
+# failed, uninstall subtracts them. No other module keeps a list.
+#
+# Three ownership shapes, and the shape decides what "safe on an existing
+# repo" means for that artifact:
+#
+#   whole-file   `.claude/rice.md` -- rice wrote the file, so rice may
+#                replace it wholesale on an update. Hand-edited at the same
+#                version is a collision: reported, never overwritten.
+#   additive     the `@.claude/rice.md` line in CLAUDE.md, the marker block
+#                in AGENTS.md, rice's own `permissions.deny` entries -- rice
+#                owns exactly what it added and nothing around it. Install
+#                adds what is missing, uninstall subtracts exactly that, and
+#                project-owned bytes are never read as drift.
+#   leaf         one rice-defined settings value at one dotted path. A
+#                different value already there is a collision that cannot be
+#                merged losslessly: reported, never guessed at.
+#
+# The pending marker is rice-created repo state too, so it lives here with
+# the rest of what rice puts in a repo (RICE-BOOTSTRAP-045 folded the old
+# bootstrap_state module in). Only verify.py removes it, on a Gate B pass.
 IMPORT_LINE = "@.claude/rice.md"
+
+MARKER_NAME = "WAITING_FOR_MATT"
+_MARKER_CONTENT = (
+    "rice bootstrap is waiting for you to personally run the official\n"
+    "Matt Pocock setup skill (setup-matt-pocock-skills). Claude cannot\n"
+    "invoke it for you -- see .claude/rice.md.\n"
+    "\n"
+    "This file is removed automatically once that setup is verified\n"
+    "complete.\n"
+)
+
+
+# Files rice creates in a target repo. The verified-version file is NOT one
+# of them: verify.py owns that, and only verify.py writes it.
+# Leaves rice used to write and no longer does. They are still rice's to
+# take back on uninstall (an already-bootstrapped repo carries them), but
+# nothing re-creates or reasserts them. RICE-BOOTSTRAP-046 retired the
+# subagent pin: which model a subagent uses is the OWNER's call per repo, so
+# it became a working rule in `.claude/rice.md` instead of a setting.
+RETIRED_LEAVES = {"env.CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"}
+
+OWNED_FILES = {
+    ".claude/rice.md": "rice-md:absent",
+    f".claude/{MARKER_NAME}": "waiting-marker:absent",
+}
+
+
+def _marker_path(repo_root) -> Path:
+    return Path(repo_root) / ".claude" / MARKER_NAME
+
+
+def enter_waiting_for_matt(repo_root) -> None:
+    """The deterministic pending marker (#13 directive H): a fresh session can
+    check it instead of Claude remembering across turns."""
+    p = _marker_path(repo_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists():
+        p.write_text(_MARKER_CONTENT, encoding="utf-8")
+
+
+def is_waiting_for_matt(repo_root) -> bool:
+    return _marker_path(repo_root).exists()
+
+# RICE-BOOTSTRAP-042: AGENTS.md is the cross-agent entry point. Codex (and
+# every other AGENTS.md reader checked) concatenates the file verbatim and has
+# no import syntax, so the only thing that can be mechanical there is an
+# instruction to read the canonical file -- never a copy of it. Claude Code
+# reads CLAUDE.md, not AGENTS.md, and there `@.claude/rice.md` is a real
+# import, so Claude gets the rules mechanically through CLAUDE.md. Either way
+# the rules themselves live in exactly one place: .claude/rice.md.
+AGENTS_BEGIN = "<!-- rice:begin -->"
+AGENTS_END = "<!-- rice:end -->"
+AGENTS_POINTER = (
+    f"{AGENTS_BEGIN}\n"
+    "## Rice working rules\n"
+    "\n"
+    "Before doing anything in this repo, read `.claude/rice.md` and follow it.\n"
+    "It is the single canonical source of the OWNER's working rules for every\n"
+    "coding agent; nothing here restates it.\n"
+    f"{AGENTS_END}\n"
+)
 RICE_MD_RESOURCE = Path(__file__).resolve().parent.parent / "resources" / "rice.md"
 
 REF_PATH = settings_template.REF_PATH
@@ -46,8 +124,6 @@ _OWNER_LEAF_KEYS = sorted(settings_template.OWNER_DEFINED_KEYS)
 
 _MISSING = object()
 
-
-PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 
 # Rubric kinds (RICE-BOOTSTRAP-020). EXISTS: the artifact/capability is
 # there. MATCHES: its content/setting equals this build's canonical state.
@@ -62,15 +138,8 @@ class ItemResult:
     state: str
     detail: str = ""
     kind: str = MATCHES
-
-
-def build_version() -> str:
-    """Version of the plugin build this rubric ships in -- the only version
-    a PASS can ever be claimed for."""
-    try:
-        return json.loads((PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")).get("version", "?")
-    except (OSError, json.JSONDecodeError):
-        return "?"
+    owned: bool = False  # rice owns this artifact: apply() can converge it,
+    #                      so repair asks the item instead of keeping a list
 
 
 def _get_path(d: dict, dotted: str):
@@ -90,6 +159,19 @@ def _set_path(d: dict, dotted: str, value) -> None:
     cur[parts[-1]] = value
 
 
+def current_settings(repo_root) -> dict | None:
+    """The repo's settings.json as a dict, or None when it exists but is not
+    a JSON object (which uninstall must not silently treat as empty)."""
+    p = Path(repo_root) / ".claude" / "settings.json"
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _current_settings(repo_root: Path) -> dict:
     p = repo_root / ".claude" / "settings.json"
     if not p.exists():
@@ -106,7 +188,7 @@ def _current_ref(settings: dict) -> str | None:
     return None if v is _MISSING else v
 
 
-def _settings_items(current: dict, ref: str | None, *, write: bool, is_rice_update: bool):
+def _settings_items(repo_root: Path, current: dict, ref: str | None, *, write: bool, is_rice_update: bool):
     """Returns (items, current) -- `current` is mutated in place when
     write=True and an item needs creating/updating."""
     if ref is None:
@@ -122,6 +204,8 @@ def _settings_items(current: dict, ref: str | None, *, write: bool, is_rice_upda
     desired = settings_template.desired_settings(ref, True)  # archive_default is inert here:
     # env.RICE_SESSION_ARCHIVE is owner-defined and never taken from `desired`.
 
+    # read before the leaves below are written: they are the marker itself
+    fresh = _is_fresh_install(repo_root, current)
     items = []
     for key in _RICE_LEAF_KEYS:
         cur = _get_path(current, key)
@@ -129,19 +213,20 @@ def _settings_items(current: dict, ref: str | None, *, write: bool, is_rice_upda
         if cur is _MISSING:
             if write:
                 _set_path(current, key, des)
-                items.append(ItemResult(f"settings:{key}", "created", f"set to {des!r}"))
+                items.append(ItemResult(f"settings:{key}", "created", f"set to {des!r}", owned=True))
             else:
-                items.append(ItemResult(f"settings:{key}", "FAIL", f"missing; desired={des!r}"))
+                items.append(ItemResult(f"settings:{key}", "FAIL", f"missing; desired={des!r}", owned=True))
         elif cur == des:
-            items.append(ItemResult(f"settings:{key}", "noop" if write else "PASS"))
+            items.append(ItemResult(f"settings:{key}", "noop" if write else "PASS", owned=True))
         elif write and is_rice_update:
             _set_path(current, key, des)
-            items.append(ItemResult(f"settings:{key}", "updated", f"{cur!r} -> {des!r}"))
+            items.append(ItemResult(f"settings:{key}", "updated", f"{cur!r} -> {des!r}", owned=True))
         else:
             items.append(ItemResult(
                 f"settings:{key}", "conflict" if write else "FAIL",
-                f"drift: current={cur!r} desired={des!r} (not overwritten)",
+                f"drift: current={cur!r} desired={des!r} (not overwritten)", owned=True,
             ))
+    items.append(_deny_item(current, write=write, fresh=fresh))
 
     for key in _OWNER_LEAF_KEYS:
         cur = _get_path(current, key)
@@ -160,6 +245,75 @@ def _settings_items(current: dict, ref: str | None, *, write: bool, is_rice_upda
     return items, current
 
 
+DENY_PATH = settings_template.DENY_PATH
+RICE_DENY_ENTRIES = settings_template.RICE_DENY_ENTRIES
+
+
+def _deny_entries(current: dict):
+    """(the repo's deny list, is it usable). A non-list value is not
+    something rice can add to without destroying it."""
+    cur = _get_path(current, DENY_PATH)
+    if cur is _MISSING:
+        return [], True
+    return (cur, True) if isinstance(cur, list) else (cur, False)
+
+
+def rice_installed_here(current: dict) -> bool:
+    """Are rice's own settings already in this repo? The rice-defined leaves
+    are that marker: `apply` writes them and nothing else does, they live in
+    the very file being edited, and `remove` takes them away again."""
+    return any(_get_path(current, k) is not _MISSING for k in _RICE_LEAF_KEYS)
+
+
+def _is_fresh_install(repo_root: Path, current: dict) -> bool:
+    """Is this apply the moment rice arrives in this repo -- the one moment
+    it may add its own occurrence of a deny rule the project may already
+    have (RICE-BOOTSTRAP-046)?
+
+    Both rice markers must be absent: its settings leaves AND the file it
+    copies in. They are written by the same `apply`, so requiring both makes
+    the answer robust to one of them being edited away afterwards -- the one
+    case a single marker would misread as "fresh" and let the multiset grow
+    by a whole set. Without a provenance manifest (deliberately not kept),
+    a truly fresh repo that already denies a rice rule and an established
+    repo stripped of BOTH markers are indistinguishable; this reads that
+    pair as fresh, which is the only reading that keeps 1 + 1 = 2."""
+    return not rice_installed_here(current) and not (repo_root / ".claude" / "rice.md").exists()
+
+
+def _deny_item(current: dict, *, write: bool, fresh: bool = False) -> ItemResult:
+    """Multiset ownership (RICE-BOOTSTRAP-045/-046): rice owns exactly ONE
+    occurrence of each rule it declares, never the list.
+
+    A fresh install appends one occurrence of every rule, even one the repo
+    already denies itself -- so a project rule and rice's rule coexist
+    (1 + 1 = 2) and uninstall can take back exactly rice's. Afterwards the
+    repo is 'established' and convergence only restores a rule whose count
+    has fallen to zero, so re-running bootstrap or an update can never grow
+    the multiset. Whatever the repo already denies keeps its value, its
+    order and its multiplicity, and is never read as drift."""
+    name = f"settings:{DENY_PATH}"
+    cur, usable = _deny_entries(current)
+    if not usable:
+        return ItemResult(name, "conflict" if write else "FAIL",
+                          f"{DENY_PATH} is {type(cur).__name__}, not a list -- rice cannot add its "
+                          "rules without destroying what is there", kind=EXISTS, owned=True)
+    add = list(RICE_DENY_ENTRIES) if (write and fresh) else [e for e in RICE_DENY_ENTRIES if e not in cur]
+    if not add:
+        return ItemResult(name, "noop" if write else "PASS",
+                          f"all {len(RICE_DENY_ENTRIES)} rice rules in effect; "
+                          f"{len(cur) - len(RICE_DENY_ENTRIES)} other rule occurrence(s) untouched",
+                          kind=EXISTS, owned=True)
+    if write:
+        _set_path(current, DENY_PATH, list(cur) + add)
+        return ItemResult(name, "created" if not cur else "updated",
+                          f"added rice's occurrence of {len(add)} rule(s); every rule already there kept",
+                          kind=EXISTS, owned=True)
+    return ItemResult(name, "FAIL", f"{len(add)} rice rule(s) not in effect: "
+                      + ", ".join(add[:3]) + ("..." if len(add) > 3 else ""),
+                      kind=EXISTS, owned=True)
+
+
 def _rice_md_item(repo_root: Path, *, write: bool, is_rice_update: bool) -> ItemResult:
     desired = RICE_MD_RESOURCE.read_text(encoding="utf-8")
     dest = repo_root / ".claude" / "rice.md"
@@ -167,17 +321,17 @@ def _rice_md_item(repo_root: Path, *, write: bool, is_rice_update: bool) -> Item
         if write:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(desired, encoding="utf-8")
-            return ItemResult("rice.md", "created")
-        return ItemResult("rice.md", "FAIL", "missing; run apply")
+            return ItemResult("rice.md", "created", owned=True)
+        return ItemResult("rice.md", "FAIL", "missing; run apply", owned=True)
     current = dest.read_text(encoding="utf-8")
     if current == desired:
-        return ItemResult("rice.md", "noop" if write else "PASS")
+        return ItemResult("rice.md", "noop" if write else "PASS", owned=True)
     if write and is_rice_update:
         dest.write_text(desired, encoding="utf-8")
-        return ItemResult("rice.md", "updated")
+        return ItemResult("rice.md", "updated", owned=True)
     return ItemResult(
         "rice.md", "conflict" if write else "FAIL",
-        "hand-edited or drifted at the same version; not overwritten",
+        "hand-edited or drifted at the same version; not overwritten", owned=True,
     )
 
 
@@ -186,366 +340,317 @@ def _claude_md_item(repo_root: Path, *, write: bool) -> ItemResult:
     if not dest.exists():
         if write:
             dest.write_text(f"{IMPORT_LINE}\n", encoding="utf-8")
-            return ItemResult("CLAUDE.md:import-line", "created", "CLAUDE.md did not exist; created with only the import line")
-        return ItemResult("CLAUDE.md:import-line", "FAIL", "CLAUDE.md missing")
+            return ItemResult("CLAUDE.md:import-line", "created", "CLAUDE.md did not exist; created with only the import line", owned=True)
+        return ItemResult("CLAUDE.md:import-line", "FAIL", "CLAUDE.md missing", owned=True)
     content = dest.read_text(encoding="utf-8")
     if any(line.strip() == IMPORT_LINE for line in content.splitlines()):
-        return ItemResult("CLAUDE.md:import-line", "noop" if write else "PASS")
+        return ItemResult("CLAUDE.md:import-line", "noop" if write else "PASS", owned=True)
     if write:
         sep = "" if content.endswith("\n") else "\n"
         dest.write_text(f"{content}{sep}\n{IMPORT_LINE}\n", encoding="utf-8")
-        return ItemResult("CLAUDE.md:import-line", "created", "import line appended; rest of file untouched")
-    return ItemResult("CLAUDE.md:import-line", "FAIL", "import line missing")
+        return ItemResult("CLAUDE.md:import-line", "created", "import line appended; rest of file untouched", owned=True)
+    return ItemResult("CLAUDE.md:import-line", "FAIL", "import line missing", owned=True)
 
 
-MATT_HEADING = "## Agent skills"
-MATT_REQUIRED_DOCS = ("docs/agents/issue-tracker.md", "docs/agents/domain.md")
-MATT_TRIAGE_DOC = "docs/agents/triage-labels.md"
-MATT_TRIAGE_HEADING = "### Triage labels"
+def _agents_block_span(content: str) -> tuple[int, int] | None:
+    """(start, end) of the rice-owned block in AGENTS.md, markers included,
+    or None. Everything outside the markers is project-owned."""
+    b = content.find(AGENTS_BEGIN)
+    if b < 0:
+        return None
+    e = content.find(AGENTS_END, b)
+    if e < 0:
+        return None
+    e += len(AGENTS_END)
+    if content[e:e + 1] == "\n":
+        e += 1
+    return b, e
 
 
-def _triage_capability_present(repo_root: Path, plugin_probe) -> bool:
-    """Matt's setup writes the triage section only when its `triage` skill
-    is installed. Mechanical signals, either suffices: the installed
-    mattpocock plugin build ships a `triage` skill (from `claude plugin
-    list --json` installPath), or the repo's CLAUDE.md carries the
-    `### Triage labels` heading Matt writes in that case."""
-    claude_md = repo_root / "CLAUDE.md"
-    if claude_md.exists() and any(l.strip() == MATT_TRIAGE_HEADING for l in claude_md.read_text(encoding="utf-8").splitlines()):
-        return True
-    try:
-        r = plugin_probe(["claude", "plugin", "list", "--json"])
-        entries = json.loads(r.stdout or "[]") if r.returncode == 0 else []
-    except (OSError, json.JSONDecodeError, AttributeError):
-        entries = []
-    for e in entries if isinstance(entries, list) else []:
-        if isinstance(e, dict) and str(e.get("id", "")).startswith("mattpocock-skills@") and e.get("installPath"):
-            root = Path(e["installPath"])
-            if root.is_dir() and any(root.glob("skills/**/triage/SKILL.md")):
-                return True
-    return False
+def _agents_md_item(repo_root: Path, *, write: bool, is_rice_update: bool) -> ItemResult:
+    """The rice pointer block in AGENTS.md: created if the file or block is
+    missing, left alone when exact, and -- like rice.md -- treated as a
+    conflict when hand-edited unless a rice-update (or repair) is converging
+    the repo. Project-owned content outside the markers is never touched."""
+    name = "AGENTS.md:rice-pointer"
+    dest = repo_root / "AGENTS.md"
+    if not dest.exists():
+        if write:
+            dest.write_text(AGENTS_POINTER, encoding="utf-8")
+            return ItemResult(name, "created", "AGENTS.md did not exist; created with only the rice pointer block", kind=EXISTS, owned=True)
+        return ItemResult(name, "FAIL", "AGENTS.md missing", kind=EXISTS, owned=True)
+    content = dest.read_text(encoding="utf-8")
+    span = _agents_block_span(content)
+    if span is None:
+        if write:
+            sep = "" if (content.endswith("\n") or not content) else "\n"
+            dest.write_text(f"{content}{sep}\n{AGENTS_POINTER}" if content else AGENTS_POINTER, encoding="utf-8")
+            return ItemResult(name, "created", "rice pointer block appended; rest of file untouched", kind=EXISTS, owned=True)
+        return ItemResult(name, "FAIL", "rice pointer block missing", kind=EXISTS, owned=True)
+    if content[span[0]:span[1]] == AGENTS_POINTER:
+        return ItemResult(name, "noop" if write else "PASS", kind=EXISTS, owned=True)
+    if write and is_rice_update:
+        dest.write_text(content[:span[0]] + AGENTS_POINTER + content[span[1]:], encoding="utf-8")
+        return ItemResult(name, "updated", "rice pointer block replaced; rest of file untouched", kind=EXISTS, owned=True)
+    return ItemResult(name, "conflict" if write else "FAIL",
+                      "rice pointer block hand-edited or drifted; not overwritten", kind=EXISTS, owned=True)
 
 
-def _matt_item(repo_root: Path, plugin_probe) -> ItemResult:
-    """Presence-only, never content-validated, never written here -- Matt's
-    artifacts remain Matt/project-owned. Required shape is the real output
-    observed from the official setup run in this repo (RICE-BOOTSTRAP-022):
-    a `## Agent skills` heading line in CLAUDE.md, docs/agents/issue-tracker.md,
-    docs/agents/domain.md, and docs/agents/triage-labels.md whenever the
-    triage capability is present."""
-    missing = []
-    claude_md = repo_root / "CLAUDE.md"
-    if not (claude_md.exists() and any(l.strip() == MATT_HEADING for l in claude_md.read_text(encoding="utf-8").splitlines())):
-        missing.append(f"CLAUDE.md `{MATT_HEADING}` heading")
-    required = list(MATT_REQUIRED_DOCS)
-    if _triage_capability_present(repo_root, plugin_probe):
-        required.append(MATT_TRIAGE_DOC)
-    for rel in required:
-        if not (repo_root / rel).is_file():
-            missing.append(rel)
-    if missing:
-        return ItemResult("matt:artifacts", "FAIL", "official Matt setup artifacts missing: " + ", ".join(missing), kind=EXISTS)
-    return ItemResult("matt:artifacts", "PASS", "present: " + ", ".join([f"`{MATT_HEADING}`", *required]), kind=EXISTS)
-
-
-def _default_rtk_probe(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
-
-
-_default_plugin_probe = _default_rtk_probe
-
-
-def _installed_entries(plugin_probe):
-    """Parsed `claude plugin list --json` (a top-level array), or an
-    ItemResult explaining why it couldn't be read."""
-    try:
-        r = plugin_probe(["claude", "plugin", "list", "--json"])
-    except FileNotFoundError:
-        return None, "claude CLI not found on PATH"
-    except OSError as exc:
-        return None, f"could not run claude plugin list: {exc}"
-    if r.returncode != 0:
-        return None, f"claude plugin list exited {r.returncode}"
-    try:
-        entries = json.loads(r.stdout or "[]")
-    except json.JSONDecodeError:
-        return None, "claude plugin list --json was not valid JSON"
-    if not isinstance(entries, list):
-        return None, "unexpected claude plugin list --json shape"
-    return [e for e in entries if isinstance(e, dict) and e.get("id") == settings_template.PLUGIN_KEY], None
-
-
-def _plugin_items(plugin_probe) -> list[ItemResult]:
-    """plugin:installed (EXISTS) and plugin:build (MATCHES).
-
-    #18 runtime facts: a project settings.json declaring the marketplace/
-    plugin does not by itself install it; only an actual install counts.
-    apply() never installs. plugin:build compares the installed version with
-    the build this rubric ships in -- if they differ, whatever ran this
-    script is not the build the repo will actually load next session, so no
-    PASS can be claimed for it."""
-    mine, err = _installed_entries(plugin_probe)
-    if err:
-        return [ItemResult("plugin:installed", "NOT_VERIFIED", err, kind=EXISTS),
-                ItemResult("plugin:build", "NOT_VERIFIED", err, kind=MATCHES)]
-    if not mine:
-        return [ItemResult(
-            "plugin:installed", "FAIL",
-            f"{settings_template.PLUGIN_KEY} is not installed on this machine; install it with "
-            "`claude plugin marketplace add L26041040/rice-bootstrap && claude plugin install "
-            f"{settings_template.PLUGIN_KEY}`, then start a new session",
-            kind=EXISTS,
-        ), ItemResult("plugin:build", "NOT_VERIFIED", "nothing installed to compare against", kind=MATCHES)]
-    e = mine[0]
-    installed = ItemResult(
-        "plugin:installed", "PASS",
-        "; ".join(f"{settings_template.PLUGIN_KEY} {x.get('version', '?')} (scope {x.get('scope', '?')}, "
-                  f"enabled={x.get('enabled')})" for x in mine),
-        kind=EXISTS,
-    )
-    bv = build_version()
-    versions = {str(x.get("version")) for x in mine}
-    if bv in versions:
-        build = ItemResult("plugin:build", "PASS", f"installed {sorted(versions)} includes this rubric's build {bv}", kind=MATCHES)
-    else:
-        build = ItemResult(
-            "plugin:build", "FAIL",
-            f"installed {sorted(versions)} but this rubric is build {bv} -- update the install "
-            "(`claude plugin update`) and/or start a new session so the loaded build matches",
-            kind=MATCHES,
-        )
-    return [installed, build]
-
-
-def _output_style_bundled_item() -> ItemResult:
-    """EXISTS: this build ships the rice style (`name: 老弟`), addressable as
-    rice:老弟 -- rice's own artifact, regardless of what the OWNER chose."""
-    styles = PLUGIN_ROOT / "output-styles"
-    for f in sorted(styles.glob("*.md")) if styles.is_dir() else []:
-        if output_styles.frontmatter_name(f) == "老弟":
-            return ItemResult("output-style:bundled", "PASS", f"{f.name} in build {build_version()} (addressed as {settings_template.RICE_STYLE})", kind=EXISTS)
-    return ItemResult("output-style:bundled", "FAIL", "no output-styles/*.md with `name: 老弟` in this build", kind=EXISTS)
-
-
-def _output_style_choice_item(repo_root: Path, current_settings: dict, plugin_probe) -> ItemResult:
-    """MATCHES: whatever `outputStyle` the OWNER chose resolves to a real
-    style. Absent key = Claude's native default (PASS). A value that points
-    at nothing is FAIL -- rice never writes or 'fixes' this key."""
-    value = _get_path(current_settings, "outputStyle")
-    ok, detail = output_styles.resolve(None if value is _MISSING else value, repo_root, plugin_probe,
-                                       self_plugin=(settings_template.PLUGIN_NAME, PLUGIN_ROOT))
-    return ItemResult("output-style:choice", "PASS" if ok else "FAIL", detail, kind=MATCHES)
-
-
-def _archive_hook_item() -> ItemResult:
-    hooks = PLUGIN_ROOT / "hooks" / "hooks.json"
-    script = PLUGIN_ROOT / "scripts" / "archive_hook.py"
-    try:
-        cfg = json.loads(hooks.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ItemResult("archive-hook:exists", "FAIL", "hooks/hooks.json missing or invalid in this build", kind=EXISTS)
-    for entry in cfg.get("hooks", {}).get("SessionEnd", []):
-        if entry.get("matcher") == "clear" and any("archive_hook.py" in h.get("command", "") for h in entry.get("hooks", [])):
-            if script.exists():
-                return ItemResult("archive-hook:exists", "PASS", kind=EXISTS)
-            return ItemResult("archive-hook:exists", "FAIL", "hooks.json wires archive_hook.py but the script is missing", kind=EXISTS)
-    return ItemResult("archive-hook:exists", "FAIL", "no SessionEnd(clear) -> archive_hook.py entry in hooks.json", kind=EXISTS)
-
-
-def _archive_sync_hook_item() -> ItemResult:
-    """RICE-BOOTSTRAP-032: registration-only, like archive-hook:exists --
-    is the SessionStart sync hook wired, never has it actually run/pushed."""
-    hooks = PLUGIN_ROOT / "hooks" / "hooks.json"
-    script = PLUGIN_ROOT / "scripts" / "archive_hook.py"
-    try:
-        cfg = json.loads(hooks.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ItemResult("archive-sync-hook:exists", "FAIL", "hooks/hooks.json missing or invalid in this build", kind=EXISTS)
-    for entry in cfg.get("hooks", {}).get("SessionStart", []):
-        if entry.get("matcher") == "clear" and any(
-            "archive_hook.py" in h.get("command", "") and "--sync" in h.get("command", "")
-            for h in entry.get("hooks", [])
-        ):
-            if script.exists():
-                return ItemResult("archive-sync-hook:exists", "PASS", kind=EXISTS)
-            return ItemResult("archive-sync-hook:exists", "FAIL",
-                               "hooks.json wires the sync hook but archive_hook.py is missing", kind=EXISTS)
-    return ItemResult("archive-sync-hook:exists", "FAIL",
-                       "no SessionStart(clear) -> archive_hook.py --sync entry in hooks.json", kind=EXISTS)
-
-
-def _archive_behaves_item(repo_root: Path, current_settings: dict) -> ItemResult:
-    """A standalone, explicit diagnostic (RICE-BOOTSTRAP-032) -- deliberately
-    NOT part of `check()`'s rubric, since every item the rubric produces
-    must be required by a gate (RICE-BOOTSTRAP-021) and this one gates
-    nothing. Call it directly (release E2E, a manual check) to ask: has
-    every Rice archive commit this repo has produced actually reached the
-    branch's upstream? PASS only from that git-state evidence -- never from
-    local file evidence alone, which would be a false PASS whenever a
-    commit is sitting unpushed."""
-    switch = _get_path(current_settings, "env.RICE_SESSION_ARCHIVE")
-    if switch is not _MISSING and str(switch) != "1":
-        return ItemResult("archive:behaves", "PASS", "archiving is switched off for this repo (RICE_SESSION_ARCHIVE != 1); nothing to exercise", kind=BEHAVES)
-    index = repo_root / "session-history" / "INDEX.md"
-    if not index.exists():
-        return ItemResult("archive:behaves", "NOT_VERIFIED", "no archive has been produced yet in this repo", kind=BEHAVES)
-    branch = archive_hook._current_branch(repo_root)
-    if not branch:
-        return ItemResult("archive:behaves", "NOT_VERIFIED", "detached HEAD; cannot compare against an upstream", kind=BEHAVES)
-    upstream = archive_hook._upstream_ref(repo_root, branch)
-    if not upstream:
-        return ItemResult("archive:behaves", "NOT_VERIFIED", f"{branch} has no upstream configured", kind=BEHAVES)
-    safe, detail = archive_hook._range_is_safe_to_push(repo_root, upstream)
-    if not safe:
-        return ItemResult("archive:behaves", "NOT_VERIFIED", f"pending, unsafe to auto-push: {detail}", kind=BEHAVES)
-    if detail == "nothing to sync":
-        return ItemResult("archive:behaves", "PASS", "every produced archive commit is present on the upstream", kind=BEHAVES)
-    return ItemResult("archive:behaves", "NOT_VERIFIED", f"pending: {detail}, not yet pushed", kind=BEHAVES)
-
-
-import os
-from datetime import datetime, timezone
-
-
-def transcript_dir(repo_root: Path) -> Path:
-    """Claude Code keeps one JSONL transcript per session under
-    <config dir>/projects/<cwd with / replaced by ->/. Under normal Claude
-    Code execution the harness writes every tool_result there itself, so a
-    permission denial found there is mechanical evidence produced by the
-    harness. rice never treats the agent's own statement as PASS; it reads
-    this record instead. No stronger claim (tamper-proofness) is made."""
-    cfg = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
-    return cfg / "projects" / str(Path(repo_root).resolve()).replace("/", "-")
-
-
-def _settings_mtime(repo_root: Path) -> float:
-    p = repo_root / ".claude" / "settings.json"
-    return p.stat().st_mtime if p.exists() else 0.0
-
-
-def _iter_tool_outcomes(tdir: Path):
-    """(timestamp, tool_name, tool_input, result_text) for every tool_use
-    that has a tool_result, across this repo's session transcripts."""
-    if not tdir.is_dir():
-        return
-    for f in sorted(tdir.glob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True):
-        uses, results = {}, []
-        try:
-            with f.open(encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        r = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    c = (r.get("message") or {}).get("content")
-                    if not isinstance(c, list):
-                        continue
-                    for b in c:
-                        if not isinstance(b, dict):
-                            continue
-                        if b.get("type") == "tool_use":
-                            uses[b.get("id")] = (b.get("name"), b.get("input") or {})
-                        elif b.get("type") == "tool_result":
-                            txt = b.get("content")
-                            if not isinstance(txt, str):
-                                txt = " ".join(x.get("text", "") for x in (txt or []) if isinstance(x, dict))
-                            results.append((r.get("timestamp") or "", b.get("tool_use_id"), txt))
-        except OSError:
-            continue
-        for ts, uid, txt in results:
-            if uid in uses:
-                name, inp = uses[uid]
-                yield ts, name, inp, txt
-
-
-def _ts_to_epoch(ts: str) -> float:
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return 0.0
-
-
-GIT_DENY_PROBE = "git branch --show-current"
-
-
-def _git_deny_evidence_item(repo_root: Path) -> ItemResult:
-    """BEHAVES, Gate A. Evidence = the harness recorded a denial for the
-    exact probe command in a session of this repo, no older than the
-    current settings.json. The probe is side-effect-free either way; the
-    agent's role is to attempt it, the harness produces the record."""
-    since = _settings_mtime(repo_root)
-    for ts, name, inp, txt in _iter_tool_outcomes(transcript_dir(repo_root)):
-        if name == "Bash" and (inp.get("command") or "").strip() == GIT_DENY_PROBE and "denied" in txt.lower():
-            if _ts_to_epoch(ts) >= since:
-                return ItemResult("git-deny:behaves", "PASS", f"harness denied `{GIT_DENY_PROBE}` at {ts}", kind=BEHAVES)
-    return ItemResult(
-        "git-deny:behaves", "NOT_VERIFIED",
-        f"no harness denial of `{GIT_DENY_PROBE}` recorded for this repo since settings.json changed -- "
-        "run that exact command through Bash in this repo (expected: denied), then re-run verify",
-        kind=BEHAVES,
-    )
-
-
-def _rtk_item(rtk_probe) -> ItemResult:
-    try:
-        r = rtk_probe(["rtk", "--version"])
-    except FileNotFoundError:
-        return ItemResult("rtk", "FAIL", "rtk not found on PATH", kind=EXISTS)
-    except OSError as exc:
-        return ItemResult("rtk", "NOT_VERIFIED", f"could not run rtk --version: {exc}", kind=EXISTS)
-    if r.returncode != 0:
-        return ItemResult("rtk", "FAIL", f"rtk --version exited {r.returncode}", kind=EXISTS)
-    return ItemResult("rtk", "PASS", r.stdout.strip(), kind=EXISTS)
-
-
-def check(repo_root, *, rtk_probe=None, plugin_probe=None) -> list[ItemResult]:
-    """Collect every rubric item of this build. This function has NO
-    verdict authority: it returns items and nothing else. Gates, the
-    RICE-VERIFIED / FINAL-VERIFIED lines, and the version stamp live in
-    verify.py, which is the only place allowed to emit them."""
-    rtk_probe = rtk_probe or _default_rtk_probe
-    plugin_probe = plugin_probe or _default_plugin_probe
+def check_owned(repo_root) -> list[ItemResult]:
+    """Every rice-owned artifact in this repo, compared with what this build
+    declares. Owned state only: no probe, no subprocess, no environment
+    (RICE-BOOTSTRAP-046) -- `evidence.py` answers those, and `verify.py`
+    alone turns both into a verdict. This function has NO verdict authority:
+    it returns items and nothing else."""
     repo_root = Path(repo_root)
     current = _current_settings(repo_root)
     ref = _current_ref(current)
-    items = _plugin_items(plugin_probe)
-    items.append(_output_style_bundled_item())
-    items.append(_output_style_choice_item(repo_root, current, plugin_probe))
-    settings_items, _ = _settings_items(current, ref, write=False, is_rice_update=False)
-    items.extend(settings_items)
+    items, _ = _settings_items(repo_root, current, ref, write=False, is_rice_update=False)
     items.append(_rice_md_item(repo_root, write=False, is_rice_update=False))
     items.append(_claude_md_item(repo_root, write=False))
-    items.append(_archive_hook_item())
-    items.append(_archive_sync_hook_item())
-    items.append(_git_deny_evidence_item(repo_root))
-    # archive:behaves is deliberately NOT part of the rubric (RICE-BOOTSTRAP-032):
-    # it is an explicit, standalone diagnostic (see `_archive_behaves_item`),
-    # called directly by release E2E / manual checks, never mixed into
-    # `check()`'s output -- every item this rubric produces must be required
-    # by a gate (RICE-BOOTSTRAP-021), and archive:behaves gates nothing.
-    items.append(_matt_item(repo_root, plugin_probe))
-    items.append(_rtk_item(rtk_probe))
+    items.append(_agents_md_item(repo_root, write=False, is_rice_update=False))
     return items
 
 
-def apply(repo_root, *, is_rice_update: bool = False, rtk_probe=None,
-          plugin_probe=None) -> list[ItemResult]:
-    rtk_probe = rtk_probe or _default_rtk_probe
-    plugin_probe = plugin_probe or _default_plugin_probe
+def current_ref(repo_root) -> str | None:
+    """The delivery ref this repo is pinned to, or None if unset."""
+    return _current_ref(_current_settings(Path(repo_root)))
+
+
+def move_ref(repo_root, sha: str) -> ItemResult:
+    """Repin the delivery ref. The update lifecycle is the ONLY caller (#13's
+    "Reconcile, check, and rice-update"): ordinary reconcile never creates,
+    fixes or reasserts this key, and bootstrap writes it only when absent."""
+    repo_root = Path(repo_root)
+    current = _current_settings(repo_root)
+    was = _current_ref(current)
+    if was == sha:
+        return ItemResult(f"settings:{REF_PATH}", "noop", f"already pinned to {sha}", kind=EXISTS)
+    _set_path(current, REF_PATH, sha)
+    p = repo_root / ".claude" / "settings.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(current, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    return ItemResult(f"settings:{REF_PATH}", "updated", f"{was!r} -> {sha!r}", kind=EXISTS)
+
+
+UNSET = object()  # "the OWNER was not asked", as distinct from None
+
+
+def write_owner_choices(repo_root, *, ref=None, archive=None, output_style=UNSET) -> list[ItemResult]:
+    """Bootstrap's first -- and only -- write of the OWNER-defined keys.
+
+    Deliberately NOT part of `apply`: `ref`, `env.RICE_SESSION_ARCHIVE` and
+    `outputStyle` are the OWNER's, written once when they are absent and
+    never created, fixed or reasserted by an ordinary reconcile pass (#13's
+    Ownership model). Each value here is written only if its key is missing,
+    so re-running bootstrap can never overwrite an OWNER's answer.
+
+    `output_style` distinguishes three cases: UNSET (not asked -- leave the
+    key exactly as it is), None (the OWNER chose Claude's native default --
+    the key stays absent, never a placeholder value), or a style name."""
+    repo_root = Path(repo_root)
+    current = _current_settings(repo_root)
+    items, wrote = [], False
+    # (key, value, what an absent key means when there is no value to write)
+    wanted = [(REF_PATH, ref, "not supplied; the key stays missing and the verifier will fail it"),
+              ("env.RICE_SESSION_ARCHIVE", None if archive is None else ("1" if archive else "0"),
+               "not supplied; the key stays missing and the verifier will fail it")]
+    if output_style is not UNSET:
+        # the one key whose absence is itself a valid answer: Claude's native default
+        wanted.append(("outputStyle", output_style, "left absent by the OWNER's choice (Claude default)"))
+    for key, value, absent_detail in wanted:
+        cur = _get_path(current, key)
+        if cur is not _MISSING:
+            items.append(ItemResult(f"settings:{key}", "noop", "owner-defined; already answered", kind=EXISTS))
+        elif value is None:
+            items.append(ItemResult(f"settings:{key}", "noop", absent_detail, kind=EXISTS))
+        else:
+            _set_path(current, key, value)
+            wrote = True
+            items.append(ItemResult(f"settings:{key}", "created", f"set to {value!r}", kind=EXISTS))
+    if wrote:
+        p = repo_root / ".claude" / "settings.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(current, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    return items
+
+
+def apply(repo_root, *, is_rice_update: bool = False) -> list[ItemResult]:
+    """Converge every rice-owned artifact onto what this build declares.
+    Create-if-missing / no-op-if-correct / conflict-if-drifted, plus
+    overwrite-on-update for the artifacts rice owns outright. Never installs
+    anything, never inspects the environment, never commits."""
     repo_root = Path(repo_root)
     settings_path = repo_root / ".claude" / "settings.json"
     current = _current_settings(repo_root)
     ref = _current_ref(current)
-    items = _plugin_items(plugin_probe)  # informational; apply never installs
-    settings_items, mutated = _settings_items(current, ref, write=True, is_rice_update=is_rice_update)
-    items.extend(settings_items)
-    if any(i.state in ("created", "updated") for i in settings_items):
+    items, mutated = _settings_items(repo_root, current, ref, write=True, is_rice_update=is_rice_update)
+    if any(i.state in ("created", "updated") for i in items):
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         settings_path.write_text(json.dumps(mutated, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
                                  encoding="utf-8")
-
     items.append(_rice_md_item(repo_root, write=True, is_rice_update=is_rice_update))
     items.append(_claude_md_item(repo_root, write=True))
-    items.append(_matt_item(repo_root, plugin_probe))
-    items.append(_rtk_item(rtk_probe))
+    items.append(_agents_md_item(repo_root, write=True, is_rice_update=is_rice_update))
     return items
+
+
+def project_settings(current: dict) -> dict:
+    """`current` minus rice's own entries. Leaves go only when they still hold
+    rice's canonical value (a project value that replaced one is theirs now);
+    deny entries are subtracted one by one, keeping every project rule in its
+    original order; containers rice emptied are dropped, containers with
+    project content stay."""
+    out = json.loads(json.dumps(current))  # deep copy, JSON-shaped
+    desired = settings_template.desired_settings("x", True)
+    was_installed = rice_installed_here(current)
+    for key in _RICE_LEAF_KEYS:
+        if _get_path(out, key) == _get_path(desired, key):
+            _del_path(out, key)
+    for key in _OWNER_LEAF_KEYS:
+        _del_path(out, key)
+    for key, value in RETIRED_LEAVES.items():
+        if _get_path(out, key) == value:
+            _del_path(out, key)
+    # Rice's deny occurrence goes only on the projection that actually
+    # completes the removal -- rice was installed here, and afterwards its
+    # marker is gone. That makes removal idempotent by construction: a second
+    # run, or one that leaves a drifted rice leaf behind, never subtracts
+    # again and so can never eat the project's own copy of a rule.
+    finishes_removal = was_installed and not rice_installed_here(out)
+    cur, usable = _deny_entries(out)
+    if usable and cur and finishes_removal:
+        kept = _subtract_rice_deny(cur)
+        if kept:
+            _set_path(out, DENY_PATH, kept)
+        else:
+            _del_path(out, DENY_PATH)
+    if _get_path(out, "outputStyle") == settings_template.RICE_STYLE:
+        _del_path(out, "outputStyle")
+    return _prune_emptied(out, current)
+
+
+def _subtract_rice_deny(entries: list) -> list:
+    """Take back exactly one occurrence of each rule rice declares -- the
+    last one, which is where a fresh install appended it, so a project's own
+    copy and its position survive."""
+    out = list(entries)
+    for rule in RICE_DENY_ENTRIES:
+        for i in range(len(out) - 1, -1, -1):
+            if out[i] == rule:
+                del out[i]
+                break
+    return out
+
+
+def _del_path(d: dict, dotted: str) -> None:
+    parts = dotted.split(".")
+    cur = d
+    for part in parts[:-1]:
+        if not isinstance(cur, dict) or part not in cur:
+            return
+        cur = cur[part]
+    if isinstance(cur, dict):
+        cur.pop(parts[-1], None)
+
+
+def _prune_emptied(projected, original):
+    """Drop only the containers this projection emptied. A container the
+    project itself left empty (`"hooks": {}`) is project-owned and stays --
+    dropping it would be rice deleting something it never put there."""
+    if not isinstance(projected, dict):
+        return projected
+    was = original if isinstance(original, dict) else {}
+    out = {}
+    for k, v in projected.items():
+        v = _prune_emptied(v, was.get(k))
+        if isinstance(v, dict) and not v and was.get(k) != {}:
+            continue  # rice emptied it
+        out[k] = v
+    return out
+
+
+def project_claude_md(text: str) -> str | None:
+    """CLAUDE.md without the rice import line (and the blank line apply put in
+    front of it when appending). None = nothing project-owned was ever in it
+    (rice created it with only the import line) -> the file goes too."""
+    lines = text.splitlines(keepends=True)
+    kept = [l for l in lines if l.strip() != IMPORT_LINE]
+    if not "".join(kept).strip():
+        return None
+    if len(kept) < len(lines):
+        while len(kept) >= 2 and kept[-1].strip() == "" and kept[-2].endswith("\n"):
+            kept.pop()
+    return "".join(kept)
+
+
+def project_agents_md(text: str) -> str | None:
+    """AGENTS.md without the rice pointer block. None = rice created the file
+    with nothing but that block."""
+    span = _agents_block_span(text)
+    if span is None:
+        return text
+    kept = text[:span[0]] + text[span[1]:]
+    if not kept.strip():
+        return None
+    if kept.endswith("\n\n"):
+        kept = kept[:-1]
+    return kept
+
+
+def remove(repo_root) -> list[str]:
+    """Subtract rice from this repo. Returns the actions taken; idempotent,
+    and byte-for-byte a no-op on everything rice does not own."""
+    repo_root = Path(repo_root)
+    actions = []
+    for rel in OWNED_FILES:
+        path = repo_root / rel
+        if path.exists():
+            path.unlink(); actions.append(f"removed {rel}")
+    s_path = repo_root / ".claude" / "settings.json"
+    current = current_settings(repo_root) if s_path.exists() else None
+    if current is not None:  # None = not a JSON object: rice touches nothing it cannot read
+        projected = project_settings(current)
+        if projected != current:
+            if projected:
+                s_path.write_text(json.dumps(projected, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+                                  encoding="utf-8")
+                actions.append("removed rice entries from .claude/settings.json")
+            else:
+                s_path.unlink(); actions.append("removed .claude/settings.json (held only rice entries)")
+    for rel, project_view, what in (("CLAUDE.md", project_claude_md, f"`{IMPORT_LINE}` line"),
+                                    ("AGENTS.md", project_agents_md, "rice pointer block")):
+        path = repo_root / rel
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        projected = project_view(text)
+        if projected is None:
+            path.unlink(); actions.append(f"removed {rel} (rice-created, held only the {what})")
+        elif projected != text:
+            path.write_text(projected, encoding="utf-8"); actions.append(f"removed the {what} from {rel}")
+    return actions
+
+
+def remnants(repo_root) -> dict:
+    """{label: detail or ""} for every rice-owned thing still present after a
+    removal -- the mechanical answer to "is rice gone". An empty detail means
+    the label is clean; uninstall.py turns this into its PASS/FAIL items."""
+    repo_root = Path(repo_root)
+    out = {}
+    for rel, label in OWNED_FILES.items():
+        out[label] = f"{rel} is still there" if (repo_root / rel).exists() else ""
+    for rel, label, project_view, what in (
+            ("CLAUDE.md", "claude-md:import-absent", project_claude_md, f"the `{IMPORT_LINE}` line"),
+            ("AGENTS.md", "agents-md:pointer-absent", project_agents_md, "the rice pointer block")):
+        path = repo_root / rel
+        text = path.read_text(encoding="utf-8") if path.exists() else None
+        out[label] = f"{rel} still carries {what}" if (text is not None and project_view(text) != text) else ""
+    current = current_settings(repo_root)
+    if current is None:
+        out["settings:rice-absent"] = ".claude/settings.json is not a JSON object"
+    else:
+        out["settings:rice-absent"] = ("rice entries remain in .claude/settings.json"
+                                       if project_settings(current) != current else "")
+    return out
+

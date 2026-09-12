@@ -38,22 +38,28 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import evidence  # noqa: E402
 import reconcile  # noqa: E402
-from bootstrap_state import MARKER_NAME  # noqa: E402
+import settings_template  # noqa: E402
+from reconcile import MARKER_NAME  # noqa: E402
 
 VERSION_FILE = ".claude/rice-version"
 
 GATE_A = (
     "plugin:installed",
     "plugin:build",
+    "plugin:scope",
     "output-style:bundled",
     "output-style:choice",
-    *sorted(f"settings:{k}" for k in reconcile.settings_template.RICE_DEFINED_KEYS),
-    *sorted(f"settings:{k}" for k in reconcile.settings_template.OWNER_DEFINED_KEYS),
+    *sorted(f"settings:{k}" for k in settings_template.RICE_DEFINED_KEYS),
+    f"settings:{settings_template.DENY_PATH}",
+    *sorted(f"settings:{k}" for k in settings_template.OWNER_DEFINED_KEYS),
     "rice.md",
     "CLAUDE.md:import-line",
+    "AGENTS.md:rice-pointer",
     "archive-hook:exists",
     "archive-sync-hook:exists",
+    "continuation-hook:exists",
     "git-deny:behaves",
 )
 
@@ -67,12 +73,35 @@ GATE_B = GATE_A + GATE_B_EXTRA
 
 @dataclass
 class Report:
+    """The verifier's complete word on a repo (RICE-BOOTSTRAP-044). Callers
+    read `ok`, `verdict`, `reasons` and `failing` from here; nothing outside
+    this module re-evaluates a gate, rebuilds a verdict string, or scrapes
+    `lines` to find one."""
     build: str
     items: list
     gate_a: bool
     gate_b: bool | None            # None when --final was not requested
     version_written: str | None    # the SemVer stamped, only on a Gate B pass
     lines: list = field(default_factory=list)
+    required: tuple = ()           # the gate that was evaluated
+    reasons: list = field(default_factory=list)   # every required item not PASS
+    verdict: str = ""              # the single line that decides this run
+
+    @property
+    def ok(self) -> bool:
+        """Did the gate that was asked for pass? Gate B when --final was
+        requested, Gate A otherwise."""
+        return self.gate_a if self.gate_b is None else self.gate_b
+
+    @property
+    def failing(self) -> list:
+        """The produced items this gate required and did not get as PASS --
+        the failure identities repair acts on."""
+        return [i for i in self.items if i.name in self.required and i.state != "PASS"]
+
+    def item(self, name: str):
+        """One item by name, or None if the rubric produced no such item."""
+        return next((i for i in self.items if i.name == name), None)
 
 
 def gate_passes(items, required) -> tuple[bool, list[str]]:
@@ -96,10 +125,14 @@ def gate_passes(items, required) -> tuple[bool, list[str]]:
 
 
 def _collect(repo_root, **probes):
-    """Every exception inside item collection becomes an ERROR item rather
-    than a crash -- and ERROR is not PASS, so the gate fails closed."""
+    """The rubric, from its two collectors: what rice owns in this repo
+    (`reconcile`) and what is true about the environment (`evidence`).
+    Neither has a verdict; this module is the only thing that does.
+
+    Every exception inside collection becomes an ERROR item rather than a
+    crash -- and ERROR is not PASS, so the gate fails closed."""
     try:
-        return reconcile.check(repo_root, **probes)
+        return reconcile.check_owned(repo_root) + evidence.collect(repo_root, **probes)
     except Exception as exc:  # noqa: BLE001 - fail closed on anything
         return [reconcile.ItemResult("verifier", "ERROR", f"{type(exc).__name__}: {exc}", kind="ERROR")]
 
@@ -111,28 +144,33 @@ def read_version(repo_root) -> str | None:
 
 def run(repo_root, *, final: bool = False, **probes) -> Report:
     repo_root = Path(repo_root)
-    build = reconcile.build_version()
+    build = evidence.build_version()
     items = _collect(repo_root, **probes)
     a_ok, a_reasons = gate_passes(items, GATE_A)
     lines = [f"[{'B' if i.name in GATE_B_EXTRA else 'A'}] {i.kind:<7} {i.state:<12} {i.name}"
              + (f" -- {i.detail}" if i.detail else "") for i in items]
     lines.append(f"rice-version on disk: {read_version(repo_root) or '(none)'}")
-    if a_ok:
-        lines.append(f"RICE-VERIFIED {build}")
-    else:
-        lines.append(f"RICE-GATE-A FAIL ({len(a_reasons)} required item(s) not PASS)")
+    verdict = (f"RICE-VERIFIED {build}" if a_ok
+               else f"RICE-GATE-A FAIL ({len(a_reasons)} required item(s) not PASS)")
+    lines.append(verdict)
+    if not a_ok:
         lines.extend(f"  - {r}" for r in a_reasons)
 
     b_ok, written = None, None
+    required, reasons = GATE_A, a_reasons
     if final:
         b_ok, b_reasons = gate_passes(items, GATE_B)
+        required, reasons = GATE_B, b_reasons
         if b_ok:
             written = _stamp(repo_root, build)
-            lines.append(f"FINAL-VERIFIED {build}")
+            verdict = f"FINAL-VERIFIED {build}"
+            lines.append(verdict)
         else:
-            lines.append(f"FINAL FAIL ({len(b_reasons)} required item(s) not PASS); rice-version untouched")
+            verdict = f"FINAL FAIL ({len(b_reasons)} required item(s) not PASS); rice-version untouched"
+            lines.append(verdict)
             lines.extend(f"  - {r}" for r in b_reasons)
-    return Report(build=build, items=items, gate_a=a_ok, gate_b=b_ok, version_written=written, lines=lines)
+    return Report(build=build, items=items, gate_a=a_ok, gate_b=b_ok, version_written=written,
+                  lines=lines, required=required, reasons=reasons, verdict=verdict)
 
 
 def _stamp(repo_root: Path, build: str) -> str:
@@ -155,8 +193,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     rep = run(args.repo_root, final=args.final)
     print("\n".join(rep.lines))
-    ok = rep.gate_b if args.final else rep.gate_a
-    return 0 if ok else 1
+    return 0 if rep.ok else 1
 
 
 if __name__ == "__main__":

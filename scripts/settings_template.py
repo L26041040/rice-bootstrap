@@ -14,9 +14,12 @@ be used verbatim for lookup. Anything not listed here is project-owned and
 never touched -- e.g. `permissions.allow`, other marketplaces, other
 plugins, other env vars.
 
-Subagents default to Sonnet via `env.CLAUDE_CODE_SUBAGENT_MODEL`; the
-OWNER names another model out loud whenever they want one -- there is no
-approval gate for that (RICE-BOOTSTRAP-024 deleted the `ask` rule).
+The subagent model is NOT a setting rice writes (RICE-BOOTSTRAP-046). It
+was `env.CLAUDE_CODE_SUBAGENT_MODEL`, hard-enforcing Sonnet on every repo
+rice touched -- a value the OWNER may legitimately want different per repo,
+per task, or not at all. It is a working rule now, in `.claude/rice.md`:
+prefer Sonnet for subagents, name another model when a task wants one.
+Nothing here enforces it, and uninstall has nothing to take back.
 
 Git safety is permission-only (RICE-BOOTSTRAP-019 superseded the narrow
 PreToolUse hook of #17): the whole `git branch` command class is denied,
@@ -35,15 +38,23 @@ REF_PATH = f"{_MP}.ref"
 
 RICE_STYLE = "rice:老弟"  # the plugin's bundled style, namespaced <plugin>:<name> (runtime-verified, #18)
 
+# Leaves rice owns outright: one value, at one dotted path, compared for
+# equality. A leaf whose value is not rice's canonical one is a collision,
+# never something to overwrite outside an update.
 RICE_DEFINED_KEYS = {
     f"{_MP}.source",
     f"{_MP}.repo",
     f"enabledPlugins.{PLUGIN_KEY}",
-    "env.CLAUDE_CODE_SUBAGENT_MODEL",
-    # rice owns the deny list wholesale; `permissions.allow`, `permissions.ask`
-    # and any other permissions key stay project-owned.
-    "permissions.deny",
 }
+
+# `permissions.deny` is NOT a rice-owned leaf (RICE-BOOTSTRAP-045/-046): it
+# is a list a repo may already be using, so rice owns exactly ONE occurrence
+# of each rule below -- a multiset, not a set. A repo that already denies
+# `Bash(git rebase*)` itself keeps its own copy: a fresh install adds rice's
+# alongside it (1 + 1 = 2), and uninstall takes back exactly one, leaving
+# the project's. `permissions.allow`, `permissions.ask` and every other
+# permissions key stay project-owned.
+DENY_PATH = "permissions.deny"
 
 OWNER_DEFINED_KEYS = {
     REF_PATH,
@@ -107,6 +118,12 @@ _MCP_DENY = [
     "mcp__github__create_branch",
 ]
 
+# The exact deny entries this build owns. Entries an older build shipped that
+# are no longer listed here are indistinguishable from a project's own rules,
+# so they are treated as project-owned: never re-added, never removed.
+RICE_DENY_ENTRIES = tuple(_DESTRUCTIVE_DENY + _BRANCH_CREATION_DENY + _MCP_DENY)
+
+
 def desired_settings(ref: str, archive_default: bool, output_style: str | None = RICE_STYLE) -> dict:
     """The full desired-state settings.json content for the given pinned
     ref, this release's archive default, and the OWNER's output-style
@@ -130,11 +147,10 @@ def desired_settings(ref: str, archive_default: bool, output_style: str | None =
             PLUGIN_KEY: True,
         },
         "env": {
-            "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet",
             "RICE_SESSION_ARCHIVE": "1" if archive_default else "0",
         },
         "permissions": {
-            "deny": _DESTRUCTIVE_DENY + _BRANCH_CREATION_DENY + _MCP_DENY,
+            "deny": list(RICE_DENY_ENTRIES),
         },
     }
     if output_style is not None:
