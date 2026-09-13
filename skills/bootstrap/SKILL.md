@@ -1,0 +1,64 @@
+---
+name: bootstrap
+description: "One-instruction bootstrap for a repo: installs rice's own configuration (git safety, session archiving, an OWNER-chosen output style, the OWNER's working rules), runs the mechanical verifier, then hands off to the OWNER for official Matt Pocock setup. Safe to re-run on an already-bootstrapped repo."
+---
+
+# rice bootstrap
+
+You are the adapter for one command. Every decision belongs to
+`scripts/rice.py`. Your job: collect two answers, run the command, pass its
+words on.
+
+## 1 — Ask the OWNER's two choices
+
+Use the native choice UI (`AskUserQuestion`), batched into as few prompts as
+possible. Each answer is written only if the setting is absent, so a re-run
+asks nothing.
+
+- **Session archive** — Enabled (recommended) → `--archive 1`; Disabled →
+  `--archive 0`. A repo with its own `/clear` archive hook: the OWNER removes
+  that hook first.
+- **Output style** — offer exactly:
+  1. `rice:老弟` (recommended) → `--output-style "rice:老弟"`
+  2. Claude default → `--output-style none` (the key stays absent; never a
+     placeholder value)
+  3. An existing style → options are exactly what
+     `python3 "<plugin root>/scripts/rice.py" styles <repo_root>` prints
+  4. A custom style → the OWNER describes it; write a valid output style to
+     `.claude/output-styles/<name>.md` (frontmatter `name`, `description`,
+     then the body), then `--output-style <name>`. Rice never rewrites it.
+
+Cannot ask → omit the flag. Never guess.
+
+## 2 — Run it
+
+```
+python3 "<plugin root>/scripts/rice.py" bootstrap <repo_root> \
+    [--archive 0|1] [--output-style <name>|none]
+```
+
+Run nothing before it: no repo analysis, no hand edits, no probing commands.
+
+## 3 — Pass its words on
+
+The output ends with a block marked
+
+```
+--- present this to the OWNER verbatim ---
+```
+
+Reply with exactly that block and **nothing after it** — no settings detail,
+no RTK line, no artifact list, no commit counts, no summary. Then do only
+what it asks of *you*: commit and push when told; fix exactly what a blocker
+line names and run the same command again.
+
+Never:
+
+- **Run, simulate, or write Matt's setup.** A missing Matt artifact is
+  reported to the OWNER by name; only
+  `/mattpocock-skills:setup-matt-pocock-skills` produces it.
+- **Ask for a second invocation.** A fresh bootstrap costs the OWNER
+  exactly one invocation of this skill. The continuation is automatic:
+  `scripts/bootstrap_continue.py` runs as a `Stop` hook and finishes the flow
+  once Matt's setup has landed.
+- **Report bootstrap complete unless the verdict says so.**
