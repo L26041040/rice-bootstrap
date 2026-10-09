@@ -2,17 +2,21 @@
 """RICE-BOOTSTRAP-044: rice's lifecycle engine -- the one place that knows
 the ORDER of things.
 
-Three verbs, and nothing outside this module needs to know more than these:
+Four verbs, and nothing outside this module needs to know more than these:
 
     bootstrap  configure this repo from scratch, up to the Matt hand-off
     continue   finish a bootstrap after the OWNER's Matt setup (Stop hook)
     styles     the output-style values the OWNER may choose from
+    questions  the OWNER choices still unanswered here (none once answered)
 
 There is no update verb (RICE-FINAL-001). Rice has exactly two repo
 lifecycles -- bootstrap and uninstall -- and neither ever asks the OWNER to
-restart a session, migrate a ref, or reason about which build is "latest".
+migrate a ref or reason about which build is "latest". An update is the
+platform's: a new session (or /reload-plugins) loads it, and one re-run of
+bootstrap brings a repo up to date.
 
-Every verb runs the same canonical flow, which lives here and only here:
+Every lifecycle verb runs the same canonical flow, which lives here and
+only here:
 
     normal path -> verify -> PASS: done
                           -> FAIL: deterministic repair -> verify again
@@ -27,7 +31,9 @@ parse evidence, rebuild a verdict, or repair anything itself:
     repair     owns which failure identity maps to which lossless restore
 
 What this module owns instead is sequence -- which of those runs when --
-and every decision that follows from it (RICE-BOOTSTRAP-044/-044B):
+and every decision that follows from it (RICE-BOOTSTRAP-044/-044B), plus
+one step of its own on an update: saving the OWNER's work with git before
+rice's first write, and where that push goes (RICE-UPDATE-PRESAVE-001):
 
 - whether rice is even loaded here, and whether the install is the
   supported one;
@@ -36,11 +42,12 @@ and every decision that follows from it (RICE-BOOTSTRAP-044/-044B):
 
 Each verb returns, besides the verifier's word, a `directive`: the exact
 text the OWNER must see. The skills and the Stop hook are adapters -- they
-collect answers, run one verb, and present the directive verbatim. They
-carry no steps, no branching on gates, and no lifecycle knowledge of their
-own.
+collect answers, run the engine's verbs, and present the directive verbatim.
+They carry no steps, no branching on gates, and no lifecycle knowledge of
+their own.
 """
 import argparse
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -129,14 +136,30 @@ class Outcome:
         return out
 
 
+def _precondition_stop(report: verify.Report) -> Outcome | None:
+    """A blocked outcome when the verifier says this session must not change
+    the repo at all (RICE-SPEC-001 I16): it is not running the installed
+    build (an update not yet loaded), or the repo was finalized by a newer
+    build. None when nothing blocks."""
+    if not report.blocking:
+        return None
+    return Outcome(report=report, stage="blocked", blocked=True,
+                   directive=_precondition_directive(report.blocking))
+
+
 def _pipeline(repo_root, *, final: bool, carried: repair.RepairResult | None = None, **probes) -> Outcome:
     """The canonical flow, in the only place it exists as code. `carried` is
     what an earlier half of the same lifecycle already restored -- a Gate A
     repair stays in the report even when Gate B then runs cleanly, so the
-    output never claims repair was "not needed" after it rewrote files."""
+    output never claims repair was "not needed" after it rewrote files.
+    Repair never runs while a precondition fails: the wrong build must not
+    rewrite the repo in the name of fixing it."""
     report = verify.run(repo_root, final=final, **probes)
     if report.ok:
         return Outcome(report=report, repaired=carried)
+    stop = _precondition_stop(report)
+    if stop is not None:
+        return stop
     repaired = repair.repair(repo_root, report, **probes)
     if carried is not None:
         repaired = repair.RepairResult(applied=carried.applied + repaired.applied,
@@ -186,18 +209,30 @@ def styles(repo_root, **probes) -> list[dict]:
                                    self_plugin=(settings_template.PLUGIN_NAME, evidence.PLUGIN_ROOT))
 
 
+# the bootstrap flag each unanswered OWNER-defined key is asked for under
+_QUESTION_FLAGS = {settings_template.ARCHIVE_KEY: "archive", settings_template.STYLE_KEY: "output-style"}
+
+
+def questions(repo_root) -> list[str]:
+    """The OWNER's Step 1 choices bootstrap would still write, by flag name:
+    both on a fresh repo, none once answered (RICE-FINAL-UX-REVIEW-001)."""
+    return [_QUESTION_FLAGS[k] for k in reconcile.unanswered_owner_choices(repo_root)]
+
+
 def bootstrap(repo_root, *, archive=None, output_style=UNSET, **probes) -> Outcome:
     """A fresh repo, up to (and when possible past) the Matt hand-off.
 
     Rice must be loaded before any of this means anything, so that is asked
-    first and nothing is written when it is not. Then the OWNER's answers are
-    written once if absent, rice-owned state is reconciled, and Gate A goes
+    first and nothing is written when it is not. On an update the OWNER's
+    work is then saved -- committed and pushed -- before rice's first write
+    (I24). Then the OWNER's answers are written once if absent, rice-owned
+    state is reconciled, and Gate A goes
     through the canonical flow. On a Gate A pass the repo enters the pending
     state -- and if Matt's artifacts are already present (a re-bootstrap, or
     a repo that had them all along), final verification happens here and now
     rather than asking the OWNER for a setup they have already done. Either
     way the OWNER invokes bootstrap exactly once (RICE-BOOTSTRAP-028), in one
-    session, and never has to restart or update anything (RICE-FINAL-001)."""
+    session, with nothing to restart mid-flow (RICE-FINAL-001)."""
     repo_root = Path(repo_root)
     loaded = verify.run(repo_root, **probes)
     installed = loaded.item("plugin:installed")
@@ -213,7 +248,23 @@ def bootstrap(repo_root, *, archive=None, output_style=UNSET, **probes) -> Outco
     _, install_directive = _canonical_install(**probes)
     if install_directive:
         return Outcome(report=loaded, stage="blocked", blocked=True, directive=install_directive)
+    # ... and this session must be the build that may change this repo (I16)
+    stop = _precondition_stop(loaded)
+    if stop is not None:
+        return stop
+    # ... and an update saves the OWNER's work before rice writes (I24)
+    stop, saved = _save_before_update(repo_root)
+    if stop is not None:
+        return stop
+    outcome = _configure(repo_root, archive=archive, output_style=output_style, **probes)
+    if saved:
+        outcome.directive = [*saved, "", *outcome.directive]
+    return outcome
 
+
+def _configure(repo_root: Path, *, archive, output_style, **probes) -> Outcome:
+    """Bootstrap past its preconditions: the OWNER's answers, rice-owned
+    state, Gate A, and -- when Matt's artifacts are there -- Gate B."""
     reconcile.write_owner_choices(repo_root, archive=archive, output_style=output_style)
     reconcile.apply(repo_root)
 
@@ -231,6 +282,145 @@ def bootstrap(repo_root, *, archive=None, output_style=UNSET, **probes) -> Outco
         return final
     return Outcome(report=gate_a.report, repaired=gate_a.repaired, waiting_for_matt=True,
                    stage="waiting-for-matt", directive=_matt_handoff_directive(gate_a.report.verdict))
+
+
+# The save's push runs inside the bootstrap command the agent started: it must
+# give up well before that command's own default timeout, and never sit at a
+# credential prompt no one can answer.
+SAVE_PUSH_TIMEOUT_SECONDS = 60
+
+# git operations left unfinished are the OWNER's: saving would complete or lose them
+_UNFINISHED_GIT_OPERATIONS = (("MERGE_HEAD", "a merge"), ("CHERRY_PICK_HEAD", "a cherry-pick"),
+                              ("REVERT_HEAD", "a revert"), ("rebase-merge", "a rebase"),
+                              ("rebase-apply", "a rebase or am"))
+
+
+def _git(repo_root: Path, *args, **kw):
+    import archive_hook  # local: the archive sync's git runner, as evidence uses its helpers
+    return archive_hook.run(["git", "-C", str(repo_root), *args], **kw)
+
+
+def _git_reason(r) -> str:
+    """Git's own words: its last lines carry the reason (a remote's rejection
+    comes before the final "failed to push"); hints are not it."""
+    out = [l.strip() for l in f"{r.stdout}\n{r.stderr}".splitlines()
+           if l.strip() and not l.strip().startswith("hint:")]
+    return " / ".join(out[-4:]) if out else f"exit {r.returncode}"
+
+
+def _push_destination(repo_root: Path, branch: str) -> tuple[str, bool, str]:
+    """(remote, tracked, refusal): where git itself would push `branch` --
+    `branch.<b>.pushRemote`, else `remote.pushDefault`, else its upstream's
+    remote, else `origin` -- whether it has an upstream, and why not to push
+    at all: an upstream of another name, which git's own push.default=simple
+    refuses too. The save pushes a branch only under its own name."""
+    def config(key: str) -> str:
+        return _git(repo_root, "config", "--get", key).stdout.strip()
+    upstream_remote, merge = config(f"branch.{branch}.remote"), config(f"branch.{branch}.merge")
+    remote = config(f"branch.{branch}.pushRemote") or config("remote.pushDefault") or upstream_remote or "origin"
+    tracked = bool(upstream_remote and merge)
+    refusal = ""
+    if tracked and remote == upstream_remote and merge != f"refs/heads/{branch}":
+        refusal = (f"its upstream is {upstream_remote}/{merge.removeprefix('refs/heads/')}, a branch of"
+                   " another name -- rice pushes a branch only under its own name")
+    return remote, tracked, refusal
+
+
+def _give_back_rices_writes(repo_root: Path, index: str) -> None:
+    """Rice's own writes from an earlier run of this same update -- a new
+    session's first run stops for the git-deny probe after writing -- are
+    rice's commit to make, not the OWNER's work: staged back to how the
+    OWNER's own index (`index`, a tree) had them."""
+    staged = _git(repo_root, "diff", "--cached", "--name-only", "-z").stdout.split("\0")
+    rices = [rel for rel in staged if rel in reconcile.RICE_WRITES
+             and reconcile.only_rices_change(repo_root, rel, _committed_text(repo_root, rel))]
+    if rices:
+        _git(repo_root, "restore", "--staged", f"--source={index}", "--", *rices)
+
+
+def _committed_text(repo_root: Path, rel: str) -> str | None:
+    """`rel` as HEAD has it, None when HEAD has no such file."""
+    r = _git(repo_root, "show", f"HEAD:{rel}")
+    return r.stdout if r.returncode == 0 else None
+
+
+def _save_before_update(repo_root: Path) -> tuple[Outcome | None, list[str]]:
+    """RICE-UPDATE-PRESAVE-001: on a real update -- this repo finalized by an
+    older rice than this build -- the OWNER running bootstrap is their
+    authorization to save everything first: `git add -A` (`.gitignore`
+    applies), less rice's own pending writes, a commit when that staged
+    anything, then a plain push of the current branch, unpushed commits
+    included, to where git itself would push it, under its own name. First
+    installs and same-version re-runs save nothing. Called only once the
+    preconditions passed, so a session that may not change this repo never
+    commits or pushes it either.
+
+    Returns (blocked outcome, []) when a step fails -- nothing of rice's is
+    written then, and the work stays in the tree with the OWNER's own index,
+    or in the local commit -- else (None, the lines to show the OWNER)."""
+    recorded, build, order = verify.version_order(repo_root)
+    if order != -1:
+        return None, []
+
+    def stop(step: str, reason: str, kept: str, then: str):
+        return Outcome(stage="blocked", blocked=True, directive=[
+            f"rice did not update this repo ({recorded} -> {build}): saving your work first failed,"
+            " so nothing of rice's was written.",
+            f"  - {step}: {reason}",
+            kept,
+            "",
+            f"Report this to the OWNER and stop. {then} Then /rice:bootstrap saves and updates again.",
+        ]), []
+
+    as_left = "Your changes are as you left them."
+    import archive_hook  # local: the archive sync's branch helper, as evidence uses it
+    branch = archive_hook._current_branch(repo_root)
+    if not branch:
+        return stop("the current branch", "HEAD is not on a branch with commits (detached, unborn,"
+                    " or not a git repository)", as_left, "Check out the branch you work on.")
+    gitdir = Path(repo_root) / _git(repo_root, "rev-parse", "--git-dir").stdout.strip()
+    for state_file, what in _UNFINISHED_GIT_OPERATIONS:
+        if (gitdir / state_file).exists():
+            return stop("the working tree", f"{what} is in progress", as_left, f"Finish or abort {what} first.")
+    index = _git(repo_root, "write-tree")  # the OWNER's own staging, to give back exactly
+    if index.returncode != 0:
+        return stop("the index", _git_reason(index), as_left, "Resolve the conflicts first.")
+    index = index.stdout.strip()
+    remote, tracked, refusal = _push_destination(repo_root, branch)
+    if refusal:
+        return stop(f"pushing {branch}", refusal, as_left, "Push this branch under its own name yourself.")
+
+    r = _git(repo_root, "add", "-A")
+    if r.returncode != 0:
+        _git(repo_root, "read-tree", index)  # index only: the files themselves are untouched
+        return stop("git add -A", _git_reason(r), as_left, "Fix what stopped `git add`.")
+    _give_back_rices_writes(repo_root, index)
+    subject = f"rice: save work before updating rice {recorded} -> {build}"
+    pending = _git(repo_root, "diff", "--cached", "--quiet").returncode
+    if pending == 1:
+        r = _git(repo_root, "commit", "-q", "-m", subject)
+    if pending not in (0, 1) or (pending == 1 and r.returncode != 0):
+        _git(repo_root, "read-tree", index)
+        return stop("git commit", _git_reason(r) if pending == 1 else f"git diff --cached exited {pending}",
+                    as_left, "Fix what stopped the commit.")
+    sha = _git(repo_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    ahead = _git(repo_root, "rev-list", "--count", "@{push}..HEAD")
+    pushed = ahead.returncode != 0 or ahead.stdout.strip() != "0"
+    if pushed:
+        push = ["push", *(() if tracked else ("-u",)), remote, f"HEAD:refs/heads/{branch}"]
+        r = _git(repo_root, *push, timeout=SAVE_PUSH_TIMEOUT_SECONDS, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        if r.returncode != 0:
+            kept = (f"Your changes are committed locally as {sha}, not pushed." if pending == 1
+                    else "Your commits are still here, not pushed.")
+            return stop("git " + " ".join(push), _git_reason(r), kept,
+                        "Push it yourself (with no remote, `git remote add origin <url>` first).")
+    # the save commit is this run's, or an earlier run's of this same update
+    saved = _git(repo_root, "log", "-1", "--format=%s").stdout.strip() == subject
+    if not (saved or pushed):
+        return None, []
+    did = [f"your changes are committed as {sha}"] if saved else []
+    did.append(f"{branch} is pushed to {remote}")
+    return None, [f"Before updating rice {recorded} -> {build}: {' and '.join(did)}."]
 
 
 def continue_after_matt(repo_root, **probes) -> Outcome | None:
@@ -286,13 +476,31 @@ def _matt_handoff_directive(verdict: str) -> list[str]:
     ]
 
 
+# What a bootstrap and Matt's setup write; every other working-tree change is
+# the OWNER's. Told to commit "the changes in the working tree", a real
+# session ran `git add -A` and pushed the OWNER's unrelated work with rice's
+# (RICE-FINAL-UX-REVIEW-001). On an update the engine's own save (I24) has
+# already committed that work by the time the agent commits rice's.
+_COMMIT_PATHS = (".claude/", "CLAUDE.md", "AGENTS.md", f"{Path(evidence.MATT_REQUIRED_DOCS[0]).parent}/")
+COMMIT_ONLY = ("stage only " + ", ".join(f"`{p}`" for p in _COMMIT_PATHS) + ", by name -- never `git add -A`"
+               " or `git add .` -- and leave every other working-tree change uncommitted for the OWNER,"
+               " naming it in your report")
+
+# CLAUDE.md imports `.claude/rice.md` when a session starts, so the session
+# that bootstrapped keeps the rules it started with (RICE-FINAL-UX-REVIEW-001)
+WHEN_RULES_LOAD = ("Rice's working rules (`.claude/rice.md`) load when a session starts: this session keeps"
+              " the ones it started with, and the current rules apply after `/clear` or in a new session.")
+
+
 def _finalized_directive(verdict: str) -> list[str]:
     return [
         f"`{verdict}`",
         "",
-        "The verifier has stamped the verified-version file. Commit and push the"
-        " changes in the working tree and quote that line verbatim. This repo needs"
-        " no Matt hand-off: the setup is already there.",
+        f"The verifier has stamped the verified-version file. Commit and push this bootstrap's"
+        f" changes ({COMMIT_ONLY}) and quote that line verbatim. This repo needs no Matt"
+        " hand-off: the setup is already there.",
+        "",
+        WHEN_RULES_LOAD,
     ]
 
 
@@ -305,6 +513,16 @@ def _blockers_directive(report) -> list[str]:
         "Do exactly what each line's detail says, then run this same command again."
         " Never write Matt setup content yourself -- a missing Matt artifact is the"
         " OWNER's to produce, with /mattpocock-skills:setup-matt-pocock-skills.",
+    ]
+
+
+def _precondition_directive(reasons) -> list[str]:
+    return [
+        "This session's rice must not change this repo, so nothing was written:",
+        *[f"  - {r}" for r in reasons],
+        "",
+        "Report this to the OWNER and stop. Do not install, update or reload rice"
+        " yourself; once the OWNER has fixed it, this same command runs normally.",
     ]
 
 
@@ -352,6 +570,8 @@ def continuation_message(repo_root, outcome: Outcome) -> str:
     and reasons, verbatim, plus the one instruction that belongs to this
     lifecycle: finish the job in this same turn, and never write Matt's
     content or send the OWNER back to rice."""
+    if outcome.blocked and outcome.directive:
+        return "rice: " + "\n".join(outcome.directive) + "\nThis hook stays quiet for the rest of this turn."
     if outcome.ok:
         repaired = ""
         if outcome.repaired and outcome.repaired.applied:
@@ -360,8 +580,8 @@ def continuation_message(repo_root, outcome: Outcome) -> str:
         return (
             f"rice: {outcome.verdict}. The verifier has stamped the verified-version file "
             f"and cleared the pending marker.{repaired} Commit and push the bootstrap, "
-            f"Matt and finalization changes in the working tree, then report `{outcome.verdict}` "
-            "to the OWNER."
+            f"Matt and finalization changes ({COMMIT_ONLY}), then report `{outcome.verdict}` "
+            f"to the OWNER, adding: {WHEN_RULES_LOAD}"
         )
     done = outcome.repaired
     repaired = "\n".join(f"  - {a}" for a in done.applied) if done and done.applied else "  - nothing was mechanically repairable"
@@ -388,18 +608,23 @@ def continuation_message(repo_root, outcome: Outcome) -> str:
 # --------------------------------------------------------------------------
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="rice lifecycle: bootstrap / continue / styles")
+    ap = argparse.ArgumentParser(description="rice lifecycle: bootstrap / continue / styles / questions")
     sub = ap.add_subparsers(dest="verb", required=True)
     b = sub.add_parser("bootstrap", help="configure this repo, up to (or past) the Matt hand-off")
     b.add_argument("repo_root", nargs="?", default=".")
     b.add_argument("--archive", choices=("0", "1"), help="the OWNER's session-archive choice (written only if absent)")
     b.add_argument("--output-style", help="the OWNER's style choice, or 'none' for Claude's default (written only if absent)")
     for verb, help_text in (("continue", "finish a bootstrap after the OWNER's Matt setup"),
-                            ("styles", "list the output styles the OWNER may choose")):
+                            ("styles", "list the output styles the OWNER may choose"),
+                            ("questions", "list the OWNER choices still unanswered in this repo")):
         sp = sub.add_parser(verb, help=help_text)
         sp.add_argument("repo_root", nargs="?", default=".")
     args = ap.parse_args(argv)
 
+    if args.verb == "questions":
+        for q in questions(args.repo_root):
+            print(q)
+        return 0
     probes = default_probes()
     if args.verb == "styles":
         for s in styles(args.repo_root, **probes):

@@ -3,6 +3,106 @@
 All notable changes to the `rice` plugin. The top entry's version must equal
 `.claude-plugin/plugin.json`'s `version` (a release check).
 
+## [0.1.7] - 2026-10-09
+
+Branches that converge, a CLAUDE.md that stays clean, a session archive that
+stays closed, and updates that are safe. Rice still has no update verb: the
+platform updates the plugin, and re-running `/rice:bootstrap` in a new
+session brings a repo up to date.
+
+Git convergence, CLAUDE.md governance, session history (RICE-SPEC-001):
+
+- **「合併回主枝」.** When the OWNER says it, the agent converges the session's
+  branch onto the default branch in a fixed, provable order (fast-forward,
+  push, prove it landed) and then removes the remote session branch with
+  rice's privileged helper -- and only then. Nothing is merged or deleted on
+  the agent's own judgement.
+- **CLAUDE.md stays routing-only.** A plugin `PreToolUse` guard refuses any
+  agent write to `CLAUDE.md` once the repo's bootstrap has finished; the
+  agent is told to put the content in an ordinary project file instead.
+  Rice's import line and Matt's block, written during bootstrap, need no
+  exception.
+- **`session-history/` is closed by default.** The agent cannot read the
+  archive until the OWNER types `/rice:history`; that key covers the current
+  `/clear` segment and closes at the next `/clear`.
+- All three are plugin-level: a repo bootstrapped by an older build picks
+  them up as soon as a session loads 0.1.7. No repo state is added.
+
+Update safety (RICE-UPDATE-SPEC-001):
+
+- **Build precondition.** `/rice:bootstrap` and the Stop continuation check
+  `plugin:build` before their first repo write. A session that has not loaded
+  the installed build (updated but not reloaded) stops, and nothing is written.
+- **Anti-downgrade.** A new verifier item, `rice-version:not-newer` (Gate A),
+  refuses a repo finalized by a newer rice: nothing is written and the version
+  is never restamped backwards. A version that is not `MAJOR.MINOR.PATCH`
+  blocks rather than being guessed at.
+- **Staleness line.** When a repo was finalized by an older rice than the one
+  running, the SessionStart context adds one line naming both versions and
+  `/rice:bootstrap`. Otherwise nothing is added.
+- **README.** Says how an update reaches a repo, and that a pinned Environment
+  stays on its release until the pin is changed.
+
+Upgrade compatibility (RICE-UPGRADE-MATRIX-001): every published release,
+upgraded by re-running `/rice:bootstrap`, now converges to exactly a fresh
+install, and uninstall leaves only the project.
+
+- **No empty containers left by this build's migration.** Taking back the
+  project-scope declaration 0.1.2/0.1.3 wrote now also takes back the
+  `extraKnownMarketplaces` / `enabledPlugins` objects it empties. A repo
+  that 0.1.4-0.1.6 already migrated keeps the empty objects they left: they
+  do nothing, and nothing can prove they are rice's.
+- **The subagent model is the project's.** `env.CLAUDE_CODE_SUBAGENT_MODEL`
+  is never removed or rewritten by bootstrap, update, repair or uninstall,
+  whatever its value -- uninstall no longer removes `"sonnet"`, as 0.1.2-0.1.6
+  did. No release branch ever wrote it, and a project sets that value for
+  its own reasons. A repo the pre-release 0.1.1 builds bootstrapped keeps the
+  `"sonnet"` they wrote until the OWNER deletes it.
+- **Re-running bootstrap is a no-op.** The release gate now checks that a
+  second `/rice:bootstrap` on every upgraded and fresh repo changes no byte.
+- **Narrower legacy identity.** Only the exact enablement those builds
+  wrote (`true`, beside rice's own marketplace entry) is rice's; a project's
+  `false`, or the enablement of a same-named marketplace that is not rice's,
+  is left alone.
+
+Updating saves your work first (RICE-UPDATE-PRESAVE-001):
+
+- **An update commits and pushes first.** When `/rice:bootstrap` finds a
+  repo set up by an older rice, it commits every change in the working tree
+  (`git add -A`, `.gitignore` respected) and pushes the current branch,
+  unpushed commits included, before writing anything of its own. Running it
+  is the OWNER's go-ahead; nothing is asked. It happens only after the build
+  and anti-downgrade checks pass. A first install, a same-version re-run and
+  the Stop continuation save nothing.
+- **A failed save stops the update.** If the commit or the push fails, or a
+  merge, rebase, cherry-pick or revert is in progress, nothing of rice's is
+  written; the work stays in the tree (with your own staging) or in the
+  local commit, and re-running saves again. It pushes where git would
+  (`pushRemote`, `pushDefault`, upstream, `origin`), never onto another
+  branch name. A repo with no remote is not updated until one is added.
+  Never a force push, rewrite or branch deletion.
+
+What real sessions showed (RICE-FINAL-UX-REVIEW-001):
+
+- **A re-run asks nothing.** `/rice:bootstrap` asks only the choices
+  `rice.py questions` prints: both on a fresh repo, none on one rice already
+  configured. An update used to re-ask both and silently drop the answers,
+  since each is written only when absent.
+- **When the rules load.** Both ways a bootstrap finishes now say that
+  `.claude/rice.md` loads when a session starts: the current rules apply
+  after `/clear` or in a new session.
+- **The staleness line reaches the OWNER.** Claude Code now shows it at
+  session start (a hook `systemMessage`); as context alone, no agent passed
+  it on. The agent's copy marks `/rice:bootstrap` as the OWNER's to type.
+- **Only rice's changes are committed.** Bootstrap and uninstall now tell
+  the agent to stage `.claude/`, `CLAUDE.md`, `AGENTS.md` (and Matt's
+  `docs/agents/`) by name, never `git add -A`, and to leave the OWNER's
+  other work uncommitted. Told to commit "the changes in the working tree",
+  an agent had pushed the OWNER's unrelated work-in-progress with rice's.
+- **Update instructions.** The README names `/reload-plugins` and the two
+  commands that update a machine; a session whose build is not the
+  installed one is told `/reload-plugins` works as well as a new session.
+
 ## [0.1.6] - 2026-09-13
 
 A privileged channel for the one git write rice denies the agent.

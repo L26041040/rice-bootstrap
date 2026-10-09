@@ -6,14 +6,19 @@ description: "One-instruction bootstrap for a repo: installs rice's own configur
 # rice bootstrap
 
 You are the adapter for one command. Every decision belongs to
-`scripts/rice.py`. Your job: collect two answers, run the command, pass its
-words on.
+`scripts/rice.py`. Your job: collect the answers it still needs, run the
+command, pass its words on.
 
-## 1 — Ask the OWNER's two choices
+## 1 — Ask the OWNER's choices still unanswered
 
-Use the native choice UI (`AskUserQuestion`), batched into as few prompts as
-possible. Each answer is written only if the setting is absent, so a re-run
-asks nothing.
+```
+python3 "<plugin root>/scripts/rice.py" questions <repo_root>
+```
+
+It prints the choices this repo has not answered yet, one per line
+(`archive`, `output-style`). Ask exactly those, with the native choice UI
+(`AskUserQuestion`), batched into one prompt. If it prints nothing, ask
+nothing and run step 2 with no flags.
 
 - **Session archive** — Enabled (recommended) → `--archive 1`; Disabled →
   `--archive 0`. A repo with its own `/clear` archive hook: the OWNER removes
@@ -37,7 +42,11 @@ python3 "<plugin root>/scripts/rice.py" bootstrap <repo_root> \
     [--archive 0|1] [--output-style <name>|none]
 ```
 
-Run nothing before it: no repo analysis, no hand edits, no probing commands.
+Run nothing else before it: no repo analysis, no hand edits, no probing
+commands.
+
+Do not stage, commit, stash or push anything yourself before it: on an
+update the command saves the OWNER's work itself and asks nothing.
 
 ## 3 — Pass its words on
 

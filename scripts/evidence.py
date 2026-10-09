@@ -192,9 +192,10 @@ def _plugin_items(plugin_probe) -> list[ItemResult]:
             "plugin:build", "FAIL",
             f"installed {sorted(versions)} but this session is running build {bv} -- they must be "
             "the same build. If the install is already the release you want, start a fresh "
-            "session so it is the one that loads; otherwise reinstall it "
+            "session (or run /reload-plugins) so it is the one that loads; otherwise reinstall it "
             f"(`claude plugin marketplace add {settings_template.MARKETPLACE_REPO}[@release/<x.y.z>]"
-            f" && claude plugin install {settings_template.PLUGIN_KEY}`) and start a fresh session",
+            f" && claude plugin install {settings_template.PLUGIN_KEY}`) and start a fresh session "
+            "or run /reload-plugins",
             kind=MATCHES,
         )
     return [installed, build]
@@ -267,7 +268,7 @@ def _output_style_choice_item(repo_root: Path, current_settings: dict, plugin_pr
     """MATCHES: whatever `outputStyle` the OWNER chose resolves to a real
     style. Absent key = Claude's native default (PASS). A value that points
     at nothing is FAIL -- rice never writes or 'fixes' this key."""
-    value = current_settings.get("outputStyle") if isinstance(current_settings, dict) else None
+    value = current_settings.get(settings_template.STYLE_KEY) if isinstance(current_settings, dict) else None
     ok, detail = output_styles.resolve(value, repo_root, plugin_probe,
                                        self_plugin=(settings_template.PLUGIN_NAME, PLUGIN_ROOT))
     return ItemResult("output-style:choice", "PASS" if ok else "FAIL", detail, kind=MATCHES)
@@ -324,7 +325,7 @@ def archive_behaves(repo_root, current_settings: dict | None = None) -> ItemResu
     branch's upstream? PASS only from that git-state evidence -- never from
     local file evidence alone, which would be a false PASS whenever a
     commit is sitting unpushed."""
-    import archive_hook  # local: only this diagnostic needs the hook's git helpers
+    import archive_hook  # local: the hook's git helpers, needed only here in this module
 
     repo_root = Path(repo_root)
     if current_settings is None:

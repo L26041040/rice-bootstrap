@@ -12,12 +12,14 @@ reasserted); `permissions.deny` is owned entry by entry. Anything not listed
 here is project-owned and never touched -- e.g. `permissions.allow`,
 marketplaces, plugins, other env vars.
 
-The subagent model is NOT a setting rice writes (RICE-BOOTSTRAP-046). It
-was `env.CLAUDE_CODE_SUBAGENT_MODEL`, hard-enforcing Sonnet on every repo
-rice touched -- a value the OWNER may legitimately want different per repo,
-per task, or not at all. It is a working rule now, in `.claude/rice.md`:
+The subagent model is NOT a setting rice writes (RICE-BOOTSTRAP-046). In
+the pre-release 0.1.1 builds on public `main` it was
+`env.CLAUDE_CODE_SUBAGENT_MODEL`, hard-enforcing Sonnet on every repo they
+touched -- a value the OWNER may legitimately want different per repo, per
+task, or not at all. It is a working rule now, in `.claude/rice.md`:
 prefer Sonnet for subagents, name another model when a task wants one.
-Nothing here enforces it, and uninstall has nothing to take back.
+Nothing here enforces it, and no lifecycle touches the key: a repo that
+carries it keeps it, whatever its value (RICE-OWNERSHIP-FIX-001).
 
 Rice's own marketplace/plugin declaration is NOT a setting rice writes
 either (RICE-FIX-001). Through 0.1.3 this template also declared
@@ -63,6 +65,14 @@ def build_version() -> str:
         return "?"
 
 
+def semver(version) -> tuple[int, int, int] | None:
+    """`MAJOR.MINOR.PATCH` as a comparable tuple, or None when the text is not
+    exactly that -- the only version shape a release ever carries."""
+    if not isinstance(version, str) or not _SEMVER.fullmatch(version):
+        return None
+    return tuple(int(p) for p in version.split("."))
+
+
 def release_ref(version: str | None = None) -> str | None:
     """The public branch that carries exactly this version, or None when the
     version is not readable SemVer -- rice never pins a ref it made up."""
@@ -81,8 +91,11 @@ RICE_STYLE = "rice:老弟"  # the plugin's bundled style, namespaced <plugin>:<n
 # permissions key stay project-owned.
 DENY_PATH = "permissions.deny"
 
+ARCHIVE_KEY = "env.RICE_SESSION_ARCHIVE"
+STYLE_KEY = "outputStyle"
+
 OWNER_DEFINED_KEYS = {
-    "env.RICE_SESSION_ARCHIVE",
+    ARCHIVE_KEY,
 }
 
 # RICE-BOOTSTRAP-023: the output style is the OWNER's choice, made once at
@@ -92,7 +105,7 @@ OWNER_DEFINED_KEYS = {
 # actually resolves to an existing style (scripts/output_styles.py);
 # reconcile never writes or reasserts it, in any mode.
 OWNER_CHOICE_KEYS = {
-    "outputStyle",
+    STYLE_KEY,
 }
 
 # Destructive / history-rewriting git operations. Bash rules match the whole
@@ -168,5 +181,5 @@ def desired_settings(archive_default: bool, output_style: str | None = RICE_STYL
         },
     }
     if output_style is not None:
-        settings["outputStyle"] = output_style
+        settings[STYLE_KEY] = output_style
     return settings

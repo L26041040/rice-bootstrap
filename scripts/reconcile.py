@@ -35,9 +35,12 @@ import settings_template
 # Three ownership shapes, and the shape decides what "safe on an existing
 # repo" means for that artifact:
 #
-#   whole-file   `.claude/rice.md` -- rice wrote the file, so rice may
-#                replace it wholesale on an update. Hand-edited at the same
-#                version is a collision: reported, never overwritten.
+#   whole-file   `.claude/rice.md` -- rice wrote the file, so rice replaces
+#                it wholesale. An ordinary reconcile reports a copy that
+#                differs from this build's as a conflict and leaves it; the
+#                repair every bootstrap runs on that FAIL restores it, so an
+#                update -- or any re-run -- brings it back to this build's.
+#                The OWNER's own rules belong in their own files, not here.
 #   additive     the `@.claude/rice.md` line in CLAUDE.md, the marker block
 #                in AGENTS.md, rice's own `permissions.deny` entries -- rice
 #                owns exactly what it added and nothing around it. Install
@@ -45,8 +48,15 @@ import settings_template
 #                project-owned bytes are never read as drift.
 #   leaf         one settings value at one dotted path -- today only the
 #                owner-defined `env.RICE_SESSION_ARCHIVE`, written once and
-#                never reasserted, and the retired leaves uninstall still
-#                takes back.
+#                never reasserted.
+#
+# Ownership is proven, never inferred from a value alone: a key no release
+# branch can be shown to have written is the project's, whatever it holds,
+# and no lifecycle -- bootstrap, update, repair, uninstall -- deletes or
+# rewrites it (RICE-OWNERSHIP-FIX-001). The subagent model is one: the
+# pre-release 0.1.1 builds on public `main` set it to "sonnet", but a project
+# sets that same value for its own reasons, so a repo that carries it keeps
+# it.
 #
 # The pending marker is rice-created repo state too, so it lives here with
 # the rest of what rice puts in a repo (RICE-BOOTSTRAP-045 folded the old
@@ -66,13 +76,6 @@ _MARKER_CONTENT = (
 
 # Files rice creates in a target repo. The verified-version file is NOT one
 # of them: verify.py owns that, and only verify.py writes it.
-# Leaves rice used to write and no longer does. They are still rice's to
-# take back on uninstall (an already-bootstrapped repo carries them), but
-# nothing re-creates or reasserts them. RICE-BOOTSTRAP-046 retired the
-# subagent pin: which model a subagent uses is the OWNER's call per repo, so
-# it became a working rule in `.claude/rice.md` instead of a setting.
-RETIRED_LEAVES = {"env.CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"}
-
 OWNED_FILES = {
     ".claude/rice.md": "rice-md:absent",
     f".claude/{MARKER_NAME}": "waiting-marker:absent",
@@ -194,44 +197,79 @@ def _current_settings(repo_root: Path) -> dict:
 
 
 def _is_rice_legacy_marketplace(entry) -> bool:
-    """Only a marketplace entry that is unmistakably rice's own -- source
-    `github`, repo this build's own public repo -- is 0.1.3-era rice state.
-    Anything else at the same name is the project's, and is left alone."""
-    if not isinstance(entry, dict):
+    """Only a marketplace entry of exactly the shape rice's own builds wrote
+    -- `{"source": {"source": "github", "repo": <this build's public repo>,
+    "ref": <a string>}}`, nothing more -- is 0.1.3-era rice state. The same
+    repo with a key added, or anything else at the same name, is the
+    project's, and is left alone."""
+    if not isinstance(entry, dict) or set(entry) != {"source"}:
         return False
-    source = entry.get("source")
-    return (isinstance(source, dict) and source.get("source") == "github"
-            and source.get("repo") == settings_template.MARKETPLACE_REPO)
+    source = entry["source"]
+    return (isinstance(source, dict) and set(source) == {"source", "repo", "ref"}
+            and source["source"] == "github" and source["repo"] == settings_template.MARKETPLACE_REPO
+            and isinstance(source["ref"], str))
 
 
 def _legacy_project_scope_present(d: dict) -> tuple[bool, bool]:
+    """(rice's marketplace entry present, rice's enablement present). Every
+    build that declared itself at project scope wrote the enablement as
+    exactly `true` beside its own marketplace entry, so only that shape is
+    rice's: a `false` (the project switching rice off), or the enablement of
+    a same-named marketplace that is not rice's, is the project's."""
     mp = _get_path(d, LEGACY_MARKETPLACE_PATH)
     has_mp = mp is not _MISSING and _is_rice_legacy_marketplace(mp)
-    has_plugin = _get_path(d, LEGACY_ENABLED_PLUGIN_PATH) is not _MISSING
+    has_plugin = (_get_path(d, LEGACY_ENABLED_PLUGIN_PATH) is True
+                  and (mp is _MISSING or has_mp))
     return has_mp, has_plugin
+
+
+def _legacy_project_scope_paths(d: dict) -> list[str]:
+    """The paths of a 0.1.3-era declaration present in `d`, marketplace first."""
+    has_mp, has_plugin = _legacy_project_scope_present(d)
+    return [path for path, present in ((LEGACY_MARKETPLACE_PATH, has_mp), (LEGACY_ENABLED_PLUGIN_PATH, has_plugin))
+            if present]
 
 
 def _strip_legacy_project_scope(d: dict) -> bool:
     """Remove a 0.1.3-era project-scope Rice declaration in place. Returns
     whether anything was removed. Unconditional and always safe: the
     identity check above is narrow enough that nothing project-owned is
-    ever at risk."""
-    has_mp, has_plugin = _legacy_project_scope_present(d)
-    if has_mp:
-        _del_path(d, LEGACY_MARKETPLACE_PATH)
-    if has_plugin:
-        _del_path(d, LEGACY_ENABLED_PLUGIN_PATH)
-    return has_mp or has_plugin
+    ever at risk.
+
+    0.1.2/0.1.3 created `extraKnownMarketplaces` and `enabledPlugins` to hold
+    that declaration, so a container this removal empties goes with it
+    (RICE-UPGRADE-MATRIX-001)."""
+    paths = _legacy_project_scope_paths(d)
+    for path in paths:
+        _take_back(d, path)
+    return bool(paths)
+
+
+def _take_back(d: dict, dotted: str) -> None:
+    """Delete one rice leaf and every container that deletion emptied --
+    the rule uninstall's projection applies (`_prune_emptied`): a container
+    rice emptied is rice's, one still holding a project entry stays."""
+    parts = dotted.split(".")
+    chain, cur = [d], d
+    for part in parts[:-1]:
+        cur = cur.get(part) if isinstance(cur, dict) else None
+        if not isinstance(cur, dict):
+            return
+        chain.append(cur)
+    chain[-1].pop(parts[-1], None)
+    for depth in range(len(parts) - 1, 0, -1):
+        if chain[depth]:
+            break
+        chain[depth - 1].pop(parts[depth - 1], None)
 
 
 def _legacy_project_scope_item(current: dict, *, write: bool) -> ItemResult:
     name = "settings:legacy-project-scope"
-    has_mp, has_plugin = _legacy_project_scope_present(current)
-    if not has_mp and not has_plugin:
+    paths = _legacy_project_scope_paths(current)
+    if not paths:
         return ItemResult(name, "noop" if write else "PASS", kind=EXISTS, owned=True)
     if not write:
-        found = ", ".join(p for p, present in
-                          ((LEGACY_MARKETPLACE_PATH, has_mp), (LEGACY_ENABLED_PLUGIN_PATH, has_plugin)) if present)
+        found = ", ".join(paths)
         return ItemResult(
             name, "FAIL",
             f"0.1.3-era project-scope Rice plugin declaration still present ({found}) -- rice is "
@@ -247,8 +285,8 @@ def _settings_items(repo_root: Path, current: dict, *, write: bool, converge_dri
     write=True and an item needs creating/updating."""
     # read before anything below is written: it is the marker itself
     fresh = _is_fresh_install(repo_root)
-    items = [_legacy_project_scope_item(current, write=write)]
-    items.append(_deny_item(current, write=write, fresh=fresh))
+    items = [_legacy_project_scope_item(current, write=write),
+             _deny_item(current, write=write, fresh=fresh)]
 
     for key in _OWNER_LEAF_KEYS:
         cur = _get_path(current, key)
@@ -445,6 +483,22 @@ def check_owned(repo_root) -> list[ItemResult]:
 UNSET = object()  # "the OWNER was not asked", as distinct from None
 
 
+def _answered(current: dict, key: str, installed: bool) -> bool:
+    """Has the OWNER answered `key`? A present value is an answer; so is an
+    absent `outputStyle` on a repo rice already configured -- Claude's
+    default, the one answer that leaves its key absent."""
+    return _get_path(current, key) is not _MISSING or (key == settings_template.STYLE_KEY and installed)
+
+
+def unanswered_owner_choices(repo_root) -> list[str]:
+    """The OWNER-defined keys still unanswered here: the only questions worth
+    asking, since `write_owner_choices` never writes an answered one."""
+    repo_root = Path(repo_root)
+    current, installed = _current_settings(repo_root), rice_installed_here(repo_root)
+    return [k for k in (settings_template.ARCHIVE_KEY, settings_template.STYLE_KEY)
+            if not _answered(current, k, installed)]
+
+
 def write_owner_choices(repo_root, *, archive=None, output_style=UNSET) -> list[ItemResult]:
     """Bootstrap's first -- and only -- write of the OWNER-defined keys.
 
@@ -458,16 +512,15 @@ def write_owner_choices(repo_root, *, archive=None, output_style=UNSET) -> list[
     key exactly as it is), None (the OWNER chose Claude's native default --
     the key stays absent, never a placeholder value), or a style name."""
     repo_root = Path(repo_root)
-    current = _current_settings(repo_root)
+    current, installed = _current_settings(repo_root), rice_installed_here(repo_root)
     items, wrote = [], False
-    wanted = [("env.RICE_SESSION_ARCHIVE", None if archive is None else ("1" if archive else "0"),
+    wanted = [(settings_template.ARCHIVE_KEY, None if archive is None else ("1" if archive else "0"),
                "not supplied; the key stays missing and the verifier will fail it")]
     if output_style is not UNSET:
         # the one key whose absence is itself a valid answer: Claude's native default
-        wanted.append(("outputStyle", output_style, "left absent by the OWNER's choice (Claude default)"))
+        wanted.append((settings_template.STYLE_KEY, output_style, "left absent by the OWNER's choice (Claude default)"))
     for key, value, absent_detail in wanted:
-        cur = _get_path(current, key)
-        if cur is not _MISSING:
+        if _answered(current, key, installed):
             items.append(ItemResult(f"settings:{key}", "noop", "owner-defined; already answered", kind=EXISTS))
         elif value is None:
             items.append(ItemResult(f"settings:{key}", "noop", absent_detail, kind=EXISTS))
@@ -503,10 +556,10 @@ def apply(repo_root, *, converge_drift: bool = False) -> list[ItemResult]:
 
 def project_settings(repo_root, current: dict) -> dict:
     """`current` minus rice's own entries. A 0.1.3-era project-scope
-    declaration goes unconditionally (RICE-FIX-001); owner-defined leaves and
-    retired ones go by key/value; deny entries are subtracted one by one,
-    keeping every project rule in its original order; containers rice
-    emptied are dropped, containers with project content stay.
+    declaration goes unconditionally (RICE-FIX-001); owner-defined leaves go
+    by key; deny entries are subtracted one by one, keeping every project
+    rule in its original order; containers rice emptied are dropped,
+    containers with project content stay.
 
     `repo_root` decides whether the deny subtraction runs at all --
     `rice_installed_here(repo_root)`, read at the moment this is called, is
@@ -521,9 +574,6 @@ def project_settings(repo_root, current: dict) -> dict:
     _strip_legacy_project_scope(out)
     for key in _OWNER_LEAF_KEYS:
         _del_path(out, key)
-    for key, value in RETIRED_LEAVES.items():
-        if _get_path(out, key) == value:
-            _del_path(out, key)
     cur, usable = _deny_entries(out)
     if usable and cur and was_installed:
         kept = _subtract_rice_deny(cur)
@@ -531,8 +581,8 @@ def project_settings(repo_root, current: dict) -> dict:
             _set_path(out, DENY_PATH, kept)
         else:
             _del_path(out, DENY_PATH)
-    if _get_path(out, "outputStyle") == settings_template.RICE_STYLE:
-        _del_path(out, "outputStyle")
+    if _get_path(out, settings_template.STYLE_KEY) == settings_template.RICE_STYLE:
+        _del_path(out, settings_template.STYLE_KEY)
     return _prune_emptied(out, current)
 
 
@@ -602,6 +652,39 @@ def project_agents_md(text: str) -> str | None:
     if kept.endswith("\n\n"):
         kept = kept[:-1]
     return kept
+
+
+# Every path a bootstrap can write in a repo (the verified-version file aside: only the
+# verifier's stamp writes it, after any save).
+RICE_WRITES = (*OWNED_FILES, "CLAUDE.md", "AGENTS.md", ".claude/settings.json")
+
+
+def only_rices_change(repo_root, rel: str, before: str | None) -> bool:
+    """Is every difference between `before` (the committed text of `rel`,
+    None when it was absent) and the file now rice's own write? Decided by
+    ownership, never by guessing (RICE-UPDATE-PRESAVE-001): `.claude/rice.md`
+    at exactly this build's content, rice's own pending marker, or a shared
+    file whose project-owned part -- the projection uninstall uses -- is
+    unchanged. Any other file is never rice's -- and is never read."""
+    if rel not in RICE_WRITES:
+        return False
+    p = Path(repo_root) / rel
+    now = p.read_text(encoding="utf-8") if p.exists() else None
+    if rel == ".claude/rice.md":
+        return now == RICE_MD_RESOURCE.read_text(encoding="utf-8")
+    if rel == f".claude/{MARKER_NAME}":
+        return True
+    if rel in ("CLAUDE.md", "AGENTS.md"):
+        project = project_claude_md if rel == "CLAUDE.md" else project_agents_md
+        return now is not None and project(now) == (project(before) if before is not None else None)
+    if rel == ".claude/settings.json":
+        try:
+            ours, theirs = json.loads(now or "{}"), json.loads(before or "{}")
+        except json.JSONDecodeError:
+            return False
+        return (isinstance(ours, dict) and isinstance(theirs, dict)
+                and project_settings(repo_root, ours) == project_settings(repo_root, theirs))
+    return False
 
 
 def remove(repo_root) -> list[str]:
