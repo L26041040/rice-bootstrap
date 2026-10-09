@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""The deterministic mechanical verifier -- the ONLY authority that may say
+RICE-VERIFIED / FINAL-VERIFIED, and the ONLY writer of .claude/rice-version.
+
+RICE-BOOTSTRAP-021. Skills, README, the spec and the agent describe how to
+operate rice; none of them decide correctness. This module does, with one
+invariant that every test in tests/test_verify.py pins down:
+
+    a gate passes only if EVERY required item of that gate has state
+    exactly "PASS". FAIL, NOT_VERIFIED, ERROR, a missing item, or any
+    unknown state => the gate FAILS. There is no allowlist, no "informational"
+    escape, and no parameter through which a caller can waive an item.
+
+Gate A (RICE-VERIFIED <build>): everything rice controls or can verify
+mechanically without the OWNER at the keyboard. Passing it is the
+precondition for entering WAITING_FOR_MATT.
+
+Gate B (FINAL-VERIFIED <build>): Gate A again, plus the items that need the
+OWNER's own actions or the environment (Matt artifacts, RTK). Matt and RTK
+are REQUIRED, not optional integrations: v1 is the OWNER's actual workflow,
+and no FINAL-VERIFIED exists without both. A real `/clear` is deliberately
+NOT required (RICE-BOOTSTRAP-032): archive registration is a Gate A fact
+(`archive-hook:exists`, `archive-sync-hook:exists` -- wired, not exercised),
+and whether a produced archive has actually reached its upstream
+(`archive:behaves`) is informational only, checked from git state, never a
+gate requirement. Only a Gate B pass writes `.claude/rice-version`; on any
+failure the file is left byte-for-byte untouched. The same pass removes the
+WAITING_FOR_MATT marker -- the deterministic re-check #28 asked for.
+
+Pyramid check for this module: Setting/Permission cannot verify
+themselves; this is a Script; no Hook is needed (verification runs when a
+skill or the E2E invokes it); nothing here is policy.
+"""
+import argparse
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import evidence  # noqa: E402
+import reconcile  # noqa: E402
+import settings_template  # noqa: E402
+from reconcile import MARKER_NAME  # noqa: E402
+
+VERSION_FILE = ".claude/rice-version"
+VERSION_ITEM = "rice-version:not-newer"  # RICE-SPEC-001 I17; produced here only
+
+GATE_A = (
+    "plugin:installed",
+    "plugin:build",
+    "plugin:scope",
+    "output-style:bundled",
+    "output-style:choice",
+    "settings:legacy-project-scope",
+    f"settings:{settings_template.DENY_PATH}",
+    *sorted(f"settings:{k}" for k in settings_template.OWNER_DEFINED_KEYS),
+    "rice.md",
+    "CLAUDE.md:import-line",
+    "AGENTS.md:rice-pointer",
+    "archive-hook:exists",
+    "archive-sync-hook:exists",
+    "continuation-hook:exists",
+    "git-deny:behaves",
+    VERSION_ITEM,
+)
+
+# RICE-SPEC-001 I16: what must hold before rice writes ANYTHING to a repo --
+# this session runs the installed build, and the repo was not finalized by a
+# newer one. Neither reads repo state rice writes, so the lifecycle engine
+# can ask them first. Judged here, like every gate.
+PRECONDITIONS = ("plugin:build", VERSION_ITEM)
+
+GATE_B_EXTRA = (
+    "matt:artifacts",
+    "rtk",
+)
+
+GATE_B = GATE_A + GATE_B_EXTRA
+
+
+@dataclass
+class Report:
+    """The verifier's complete word on a repo (RICE-BOOTSTRAP-044). Callers
+    read `ok`, `verdict`, `reasons` and `failing` from here; nothing outside
+    this module re-evaluates a gate, rebuilds a verdict string, or scrapes
+    `lines` to find one."""
+    build: str
+    items: list
+    gate_a: bool
+    gate_b: bool | None            # None when --final was not requested
+    version_written: str | None    # the SemVer stamped, only on a Gate B pass
+    lines: list = field(default_factory=list)
+    required: tuple = ()           # the gate that was evaluated
+    reasons: list = field(default_factory=list)   # every required item not PASS
+    blocking: list = field(default_factory=list)  # every PRECONDITIONS item not PASS: no repo write may happen
+    verdict: str = ""              # the single line that decides this run
+
+    @property
+    def ok(self) -> bool:
+        """Did the gate that was asked for pass? Gate B when --final was
+        requested, Gate A otherwise."""
+        return self.gate_a if self.gate_b is None else self.gate_b
+
+    @property
+    def failing(self) -> list:
+        """The produced items this gate required and did not get as PASS --
+        the failure identities repair acts on."""
+        return [i for i in self.items if i.name in self.required and i.state != "PASS"]
+
+    def item(self, name: str):
+        """One item by name, or None if the rubric produced no such item."""
+        return next((i for i in self.items if i.name == name), None)
+
+
+def gate_passes(items, required) -> tuple[bool, list[str]]:
+    """The invariant. Returns (passed, reasons). A reason is recorded for
+    every required item that is not exactly PASS, including absent ones.
+    If a name occurs more than once, every occurrence must be PASS -- a
+    duplicate can never mask a failure."""
+    by_name: dict[str, list] = {}
+    for i in items:
+        by_name.setdefault(i.name, []).append(i)
+    reasons = []
+    for name in required:
+        occurrences = by_name.get(name)
+        if not occurrences:
+            reasons.append(f"{name}: MISSING (verifier produced no result for a required item)")
+            continue
+        for i in occurrences:
+            if i.state != "PASS":
+                reasons.append(f"{name}: {i.state}" + (f" -- {i.detail}" if i.detail else ""))
+    return (not reasons), reasons
+
+
+def _collect(repo_root, **probes):
+    """The rubric, from its collectors: what rice owns in this repo
+    (`reconcile`), what is true about the environment (`evidence`), and how
+    the version this module recorded compares with the running build (here,
+    because only this module may touch that file). None of them has a
+    verdict; this module is the only thing that does.
+
+    Every exception inside collection becomes an ERROR item rather than a
+    crash -- and ERROR is not PASS, so the gate fails closed."""
+    try:
+        return (reconcile.check_owned(repo_root) + evidence.collect(repo_root, **probes)
+                + [version_not_newer_item(repo_root)])
+    except Exception as exc:  # noqa: BLE001 - fail closed on anything
+        return [reconcile.ItemResult("verifier", "ERROR", f"{type(exc).__name__}: {exc}", kind="ERROR")]
+
+
+def read_version(repo_root) -> str | None:
+    p = Path(repo_root) / VERSION_FILE
+    return p.read_text(encoding="utf-8").strip() if p.exists() else None
+
+
+def version_order(repo_root) -> tuple[str | None, str, int | None]:
+    """(recorded, build, order): the version this repo was last verified at,
+    the running build's, and how they compare -- -1 recorded older, 0 equal,
+    1 recorded newer, None when either side is not `MAJOR.MINOR.PATCH`
+    (recorded is None when nothing was ever verified here). The one place
+    that compares them; the anti-downgrade item and the SessionStart
+    staleness line both ask this."""
+    recorded, build = read_version(repo_root), evidence.build_version()
+    r, b = settings_template.semver(recorded), settings_template.semver(build)
+    return recorded, build, (None if r is None or b is None else (r > b) - (r < b))
+
+
+def version_not_newer_item(repo_root):
+    """rice-version:not-newer (MATCHES, Gate A; RICE-SPEC-001 I17). A repo
+    finalized by a newer rice must never be restamped -- or rewritten -- by
+    an older one, so this item fails closed before any mutation path can
+    act on it, this module's own Gate B stamp included."""
+    recorded, build, order = version_order(repo_root)
+    if recorded is None:
+        return reconcile.ItemResult(VERSION_ITEM, "PASS", "nothing to compare: this repo has no verified version yet")
+    if order is None:
+        return reconcile.ItemResult(VERSION_ITEM, "NOT_VERIFIED",
+                                    f"cannot compare recorded {recorded!r} with this build {build!r}: both must be "
+                                    "MAJOR.MINOR.PATCH; rice never rewrites the file -- fix it by hand or uninstall")
+    if order > 0:
+        return reconcile.ItemResult(VERSION_ITEM, "FAIL",
+                                    f"this repo was finalized by rice {recorded}, newer than this session's rice "
+                                    f"{build}; nothing was changed. Start a session that loads rice {recorded} or "
+                                    "newer, or change the Environment's release pin")
+    return reconcile.ItemResult(VERSION_ITEM, "PASS", f"recorded {recorded} <= build {build}")
+
+
+def run(repo_root, *, final: bool = False, **probes) -> Report:
+    repo_root = Path(repo_root)
+    build = evidence.build_version()
+    items = _collect(repo_root, **probes)
+    a_ok, a_reasons = gate_passes(items, GATE_A)
+    lines = [f"[{'B' if i.name in GATE_B_EXTRA else 'A'}] {i.kind:<7} {i.state:<12} {i.name}"
+             + (f" -- {i.detail}" if i.detail else "") for i in items]
+    lines.append(f"rice-version on disk: {read_version(repo_root) or '(none)'}")
+    verdict = (f"RICE-VERIFIED {build}" if a_ok
+               else f"RICE-GATE-A FAIL ({len(a_reasons)} required item(s) not PASS)")
+    lines.append(verdict)
+    if not a_ok:
+        lines.extend(f"  - {r}" for r in a_reasons)
+
+    b_ok, written = None, None
+    required, reasons = GATE_A, a_reasons
+    if final:
+        b_ok, b_reasons = gate_passes(items, GATE_B)
+        required, reasons = GATE_B, b_reasons
+        if b_ok:
+            written = _stamp(repo_root, build)
+            verdict = f"FINAL-VERIFIED {build}"
+            lines.append(verdict)
+        else:
+            verdict = f"FINAL FAIL ({len(b_reasons)} required item(s) not PASS); rice-version untouched"
+            lines.append(verdict)
+            lines.extend(f"  - {r}" for r in b_reasons)
+    _, blocking = gate_passes(items, PRECONDITIONS)
+    return Report(build=build, items=items, gate_a=a_ok, gate_b=b_ok, version_written=written,
+                  lines=lines, required=required, reasons=reasons, verdict=verdict, blocking=blocking)
+
+
+def _stamp(repo_root: Path, build: str) -> str:
+    """The one and only write of the verified version. Called exclusively
+    from a Gate B pass. Also clears the WAITING_FOR_MATT marker, since a
+    Gate B pass by definition includes matt:artifacts PASS."""
+    p = repo_root / VERSION_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(build + "\n", encoding="utf-8")
+    marker = repo_root / ".claude" / MARKER_NAME
+    if marker.exists():
+        marker.unlink()
+    return build
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="rice mechanical verifier")
+    ap.add_argument("repo_root", nargs="?", default=".")
+    ap.add_argument("--final", action="store_true", help="also evaluate Gate B and, on PASS, stamp .claude/rice-version")
+    args = ap.parse_args(argv)
+    rep = run(args.repo_root, final=args.final)
+    print("\n".join(rep.lines))
+    return 0 if rep.ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
