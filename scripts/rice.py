@@ -486,6 +486,23 @@ COMMIT_ONLY = ("stage only " + ", ".join(f"`{p}`" for p in _COMMIT_PATHS) + ", b
                " or `git add .` -- and leave every other working-tree change uncommitted for the OWNER,"
                " naming it in your report")
 
+# rice.md's own output rules, by heading: the session that bootstraps never
+# loaded rice.md, so rice hands these to the agent wherever it speaks during
+# a bootstrap (RICE-BOOTSTRAP-UX-FIX-001).
+_OUTPUT_RULE_HEADINGS = ("## Conversation numbering", "## Single-block output")
+
+
+def output_rules() -> str:
+    """rice.md's output rules, in its own words, for an agent that may not
+    have rice.md loaded: what every formal report in a bootstrap follows."""
+    text = reconcile.RICE_MD_RESOURCE.read_text(encoding="utf-8")
+    parts = [h + "\n" + text.split(h + "\n", 1)[1].split("\n## ", 1)[0].strip()
+             for h in _OUTPUT_RULE_HEADINGS if h + "\n" in text]
+    return ("rice's output rules (from .claude/rice.md, which this session may not have loaded) apply to every"
+            " formal report in this bootstrap -- this one, the summary after the OWNER's Matt setup, and the"
+            " finalization; native choice prompts stay native:\n\n" + "\n\n".join(parts))
+
+
 # CLAUDE.md imports `.claude/rice.md` when a session starts, so the session
 # that bootstrapped keeps the rules it started with (RICE-FINAL-UX-REVIEW-001)
 WHEN_RULES_LOAD = ("Rice's working rules (`.claude/rice.md`) load when a session starts: this session keeps"
@@ -569,7 +586,12 @@ def continuation_message(repo_root, outcome: Outcome) -> str:
     """What the Stop hook hands back to the model. The verifier's own verdict
     and reasons, verbatim, plus the one instruction that belongs to this
     lifecycle: finish the job in this same turn, and never write Matt's
-    content or send the OWNER back to rice."""
+    content or send the OWNER back to rice -- and, whatever the outcome,
+    rice's output rules for the report that follows."""
+    return f"{_continuation(repo_root, outcome)}\n\n{output_rules()}"
+
+
+def _continuation(repo_root, outcome: Outcome) -> str:
     if outcome.blocked and outcome.directive:
         return "rice: " + "\n".join(outcome.directive) + "\nThis hook stays quiet for the rest of this turn."
     if outcome.ok:
@@ -581,7 +603,9 @@ def continuation_message(repo_root, outcome: Outcome) -> str:
             f"rice: {outcome.verdict}. The verifier has stamped the verified-version file "
             f"and cleared the pending marker.{repaired} Commit and push the bootstrap, "
             f"Matt and finalization changes ({COMMIT_ONLY}), then report `{outcome.verdict}` "
-            f"to the OWNER, adding: {WHEN_RULES_LOAD}"
+            f"to the OWNER as one formal report -- your conversation number, then one fenced code block"
+            f" holding the verdict, what you committed and pushed, and this line: {WHEN_RULES_LOAD} --"
+            f" and nothing outside it."
         )
     done = outcome.repaired
     repaired = "\n".join(f"  - {a}" for a in done.applied) if done and done.applied else "  - nothing was mechanically repairable"
@@ -598,8 +622,9 @@ def continuation_message(repo_root, outcome: Outcome) -> str:
         "write Matt setup content yourself -- a Matt artifact listed above must be "
         "reported to the OWNER as missing, by name, because only the official Matt "
         "setup can produce it. Then finish the job in this same turn by running "
-        f"`python3 {VERIFIER} {repo_root} --final` yourself. This hook stays quiet "
-        "for the rest of this turn."
+        f"`python3 {VERIFIER} {repo_root} --final` yourself. Whatever is the OWNER's to do -- a "
+        "missing Matt artifact, a GitHub credential -- goes to them once, as one formal report. This "
+        "hook stays quiet for the rest of this turn."
     )
 
 
@@ -642,6 +667,7 @@ def main(argv=None) -> int:
             return 0
     print("\n".join(outcome.lines))
     if outcome.directive:
+        print("\n" + output_rules())
         print("\n--- present this to the OWNER verbatim ---")
         print("\n".join(outcome.directive))
     return 0 if outcome.ok else 1

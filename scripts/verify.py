@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import evidence  # noqa: E402
+import github_labels  # noqa: E402
 import reconcile  # noqa: E402
 import settings_template  # noqa: E402
 from reconcile import MARKER_NAME  # noqa: E402
@@ -73,6 +74,7 @@ PRECONDITIONS = ("plugin:build", VERSION_ITEM)
 
 GATE_B_EXTRA = (
     "matt:artifacts",
+    "matt:labels",
     "rtk",
 )
 
@@ -133,9 +135,10 @@ def gate_passes(items, required) -> tuple[bool, list[str]]:
     return (not reasons), reasons
 
 
-def _collect(repo_root, **probes):
+def _collect(repo_root, *, final: bool = False, github_probe=None, **probes):
     """The rubric, from its collectors: what rice owns in this repo
-    (`reconcile`), what is true about the environment (`evidence`), and how
+    (`reconcile`), what is true about the environment (`evidence`), the
+    triage labels on GitHub (`github_labels`, final verification only), and how
     the version this module recorded compares with the running build (here,
     because only this module may touch that file). None of them has a
     verdict; this module is the only thing that does.
@@ -143,7 +146,9 @@ def _collect(repo_root, **probes):
     Every exception inside collection becomes an ERROR item rather than a
     crash -- and ERROR is not PASS, so the gate fails closed."""
     try:
-        return (reconcile.check_owned(repo_root) + evidence.collect(repo_root, **probes)
+        # the labels belong to Gate B alone, so only final verification asks GitHub
+        labels = [github_labels.item(repo_root, github_probe)] if final else []
+        return (reconcile.check_owned(repo_root) + evidence.collect(repo_root, **probes) + labels
                 + [version_not_newer_item(repo_root)])
     except Exception as exc:  # noqa: BLE001 - fail closed on anything
         return [reconcile.ItemResult("verifier", "ERROR", f"{type(exc).__name__}: {exc}", kind="ERROR")]
@@ -189,7 +194,7 @@ def version_not_newer_item(repo_root):
 def run(repo_root, *, final: bool = False, **probes) -> Report:
     repo_root = Path(repo_root)
     build = evidence.build_version()
-    items = _collect(repo_root, **probes)
+    items = _collect(repo_root, final=final, **probes)
     a_ok, a_reasons = gate_passes(items, GATE_A)
     lines = [f"[{'B' if i.name in GATE_B_EXTRA else 'A'}] {i.kind:<7} {i.state:<12} {i.name}"
              + (f" -- {i.detail}" if i.detail else "") for i in items]
